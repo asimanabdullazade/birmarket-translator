@@ -1,0 +1,147 @@
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background: #f4f5f7;
+  color: #1c1e21;
+}
+
+.app {
+  max-width: 480px;
+  margin: 48px auto;
+  padding: 0 16px;
+}
+
+h1 {
+  font-size: 1.4rem;
+  margin-bottom: 20px;
+}
+
+.panel {
+  background: #ffffff;
+  border: 1px solid #e2e4e8;
+  border-radius: 10px;
+  padding: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.row {
+  display: flex;
+  gap: 16px;
+}
+
+.field {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 0.85rem;
+}
+
+.field-label {
+  color: #555;
+  font-weight: 600;
+}
+
+select {
+  padding: 8px 10px;
+  border-radius: 6px;
+  border: 1px solid #ccced4;
+  font-size: 0.95rem;
+  background: #fff;
+}
+
+.controls {
+  display: flex;
+  gap: 10px;
+}
+
+.btn {
+  flex: 1;
+  padding: 10px 16px;
+  border-radius: 8px;
+  border: none;
+  font-size: 0.95rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-start {
+  background: #2f7d3f;
+  color: #fff;
+}
+
+.btn-stop {
+  background: #b3261e;
+  color: #fff;
+}
+
+.status-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.9rem;
+}
+
+.status-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.status-idle {
+  background: #9aa0a6;
+}
+
+.status-connected {
+  background: #4285f4;
+}
+
+.status-listening {
+  background: #2f7d3f;
+}
+
+.status-translating {
+  background: #f4a300;
+}
+
+.status-error {
+  background: #b3261e;
+}
+
+.status-error-detail {
+  color: #b3261e;
+  font-size: 0.8rem;
+}
+
+.permission-warning {
+  color: #b3261e;
+  font-size: 0.85rem;
+  margin: 0;
+}
+
+.results {
+  font-size: 0.9rem;
+  background: #f7f8fa;
+  border-radius: 8px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.results-label {
+  font-weight: 600;
+  color: #555;
+}
