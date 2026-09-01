@@ -12,9 +12,5 @@ export const AUDIO_SAMPLE_RATE = 16000;
 export const FALLBACK_LANGUAGES = [
   { code: "en", name: "English" },
   { code: "az", name: "Azerbaijani" },
-  { code: "tr", name: "Turkish" },
   { code: "ru", name: "Russian" },
-  { code: "es", name: "Spanish" },
-  { code: "fr", name: "French" },
-  { code: "de", name: "German" },
 ];
