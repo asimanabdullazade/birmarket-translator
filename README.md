@@ -155,3 +155,67 @@ language, microphone selector, output-device selector, Start/Stop, and a
 status line (Connected / Listening / Translating / Error). Playback of
 translated audio through the selected output device, richer transcript
 history, and auth are all left for later iterations.
+
+## Testing the microphone pipeline (Step 2: clean mic input)
+
+Before worrying about translation quality, verify the capture/streaming
+pipeline itself is clean:
+
+1. In `config/.env`, set `TRANSLATION_PROVIDER=mock` (isolates this test
+   from any translation API/model) and `DEBUG_AUDIO_DUMP_DIR=./debug_audio`.
+2. Restart the backend, start the frontend, hit **Start Translation**, and
+   say: *"Hello, this is a test."* Let it keep listening for a few minutes
+   (podcast audio, music, silence -- whatever's around) before hitting Stop.
+3. Check the backend terminal: no `Possible audio gap` or `duplicate audio
+   frame` warnings should appear during normal speech.
+4. Open the `.wav` file written to `debug_audio/` (backend logs its exact
+   path when the session starts) in any audio player. It should sound
+   exactly like what you said -- no pitch shift, no clicks/static, no
+   repeated segments, no missing sections.
+
+What's actually being tested: the frontend's `AudioWorklet`
+(`frontend/public/pcmWorkletProcessor.js`) requests a 16kHz mono
+`AudioContext`, but some browsers/OS audio stacks silently ignore that and
+keep running at their hardware's native rate (e.g. 48kHz) -- if that
+happened and went uncorrected, the recording would sound sped-up/pitched
+("chipmunk" distortion). The worklet detects this via the
+`sampleRate` it's actually given and resamples on the fly, logging
+`[MicCapture] Resampling ...` to the browser console if it kicks in. It also
+batches raw audio into ~200ms chunks (`AUDIO_SEND_CHUNK_MS` in
+`frontend/src/config.js`) before sending each one over the WebSocket --
+small enough for low latency, large enough not to flood the socket with a
+message every few milliseconds. The backend's gap/duplicate-frame checks
+and `.wav` dump (`backend/websocket/handlers.py`) exist purely to make this
+step verifiable; leave `DEBUG_AUDIO_DUMP_DIR` unset for normal use.
+
+## Testing the microphone pipeline (Step 2: clean mic input)
+
+Before worrying about translation quality, verify the capture/streaming
+pipeline itself is clean:
+
+1. In `config/.env`, set `TRANSLATION_PROVIDER=mock` (isolates this test
+   from any translation API/model) and `DEBUG_AUDIO_DUMP_DIR=./debug_audio`.
+2. Restart the backend, start the frontend, hit **Start Translation**, and
+   say: *"Hello, this is a test."* Let it keep listening for a few minutes
+   (podcast audio, music, silence -- whatever's around) before hitting Stop.
+3. Check the backend terminal: no `Possible audio gap` or `duplicate audio
+   frame` warnings should appear during normal speech.
+4. Open the `.wav` file written to `debug_audio/` (backend logs its exact
+   path when the session starts) in any audio player. It should sound
+   exactly like what you said -- no pitch shift, no clicks/static, no
+   repeated segments, no missing sections.
+
+What's actually being tested: the frontend's `AudioWorklet`
+(`frontend/public/pcmWorkletProcessor.js`) requests a 16kHz mono
+`AudioContext`, but some browsers/OS audio stacks silently ignore that and
+keep running at their hardware's native rate (e.g. 48kHz) -- if that
+happened and went uncorrected, the recording would sound sped-up/pitched
+("chipmunk" distortion). The worklet detects this via the
+`sampleRate` it's actually given and resamples on the fly, logging
+`[MicCapture] Resampling ...` to the browser console if it kicks in. It also
+batches raw audio into ~200ms chunks (`AUDIO_SEND_CHUNK_MS` in
+`frontend/src/config.js`) before sending each one over the WebSocket --
+small enough for low latency, large enough not to flood the socket with a
+message every few milliseconds. The backend's gap/duplicate-frame checks
+and `.wav` dump (`backend/websocket/handlers.py`) exist purely to make this
+step verifiable; leave `DEBUG_AUDIO_DUMP_DIR` unset for normal use.

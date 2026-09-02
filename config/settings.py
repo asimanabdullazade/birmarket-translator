@@ -64,6 +64,14 @@ class Settings(BaseSettings):
     # --- Logging ---
     log_level: str = "INFO"
 
+    # --- Debugging / testing ---
+    # When set, every session's raw incoming PCM16LE audio (exactly as
+    # received over the WebSocket, before any provider-side chunking) is
+    # written to a timestamped .wav file in this directory -- lets you
+    # literally play back what the backend received, to check for
+    # distortion, gaps, or duplicated audio. Leave unset in normal use.
+    debug_audio_dump_dir: Optional[str] = None
+
 
 @lru_cache
 def get_settings() -> Settings:
