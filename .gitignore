@@ -23,3 +23,9 @@ npm-debug.log*
 
 # Logs
 *.log
+
+# Debug audio dumps (DEBUG_AUDIO_DUMP_DIR)
+debug_audio/
+
+# Debug audio dumps (DEBUG_AUDIO_DUMP_DIR)
+debug_audio/
