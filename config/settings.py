@@ -72,6 +72,10 @@ class Settings(BaseSettings):
     vad_threshold: float = 0.01
     vad_pre_speech_ms: float = 400.0
     vad_end_silence_ms: float = 500.0
+    # How often (ms) to surface an interim transcript while a phrase is
+    # still being spoken -- see "Step 4" / backend/websocket/handlers.py.
+    # Lower = more responsive partial updates but more provider calls.
+    vad_partial_interval_ms: float = 700.0
 
     # --- Logging ---
     log_level: str = "INFO"

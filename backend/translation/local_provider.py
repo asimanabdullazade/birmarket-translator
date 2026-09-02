@@ -32,6 +32,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+from typing import Optional
 
 import numpy as np
 
@@ -152,6 +153,19 @@ class LocalWhisperNLLBProvider(TranslationProvider):
             TranslationEvent(kind=EventKind.TRANSLATION, text=translation, is_final=True),
         ]
 
+    async def transcribe_partial(self, pcm16_bytes: bytes) -> Optional[str]:
+        audio = AudioBuffer.to_numpy(pcm16_bytes)
+        if audio.size == 0:
+            return None
+        loop = asyncio.get_event_loop()
+        # Reuses the same (forced-language, see _transcribe's docstring)
+        # decode as the final pass, just re-run on however much audio has
+        # accumulated so far -- simple, correct, but means partial cost
+        # scales with how much of the phrase has been spoken, not just the
+        # newest bit of it. Fine for the short phrases this app targets.
+        transcript = (await loop.run_in_executor(None, self._transcribe, audio)).strip()
+        return transcript or None
+
     async def close_session(self) -> list[TranslationEvent]:
         return []
 
@@ -159,6 +173,17 @@ class LocalWhisperNLLBProvider(TranslationProvider):
 
     def _transcribe(self, audio: np.ndarray) -> str:
         model = _get_whisper_model(self._whisper_model_size, self._whisper_compute_type)
+        # `language` is forced to the user's UI selection rather than left
+        # as None for auto-detection -- Whisper's auto-detect is noticeably
+        # less reliable on short clips (a few seconds) than being told the
+        # language outright, and this app already has the user pick source
+        # language explicitly, so there's nothing to gain and accuracy to
+        # lose by second-guessing it here. If you want a genuine detected
+        # language signal from this provider, pass language=None instead
+        # and read info.language/info.language_probability -- but expect
+        # more misfires on short utterances. gemini_provider.py surfaces
+        # real detection instead, at no extra cost (same API call already
+        # being made), if you want that without the accuracy trade-off.
         segments, _info = model.transcribe(audio, language=self._source_lang, vad_filter=True)
         return " ".join(segment.text for segment in segments)
 

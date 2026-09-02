@@ -13,18 +13,29 @@ Message flow
    Server opens a provider session, starts a background task to process
    completed phrases, and sends `status: listening`.
 3. Client streams binary PCM16LE audio frames. Each frame is fed to a
-   `SpeechSegmenter`, which decides *when a phrase begins and ends* (see
-   backend/audio/segmenter.py) -- only complete phrases are handed off for
-   translation, not silence or arbitrary fixed-size windows. Handoff goes
-   through a queue, not a direct call -- see "Why a queue" below. The
-   background task drains the queue, calling the provider and relaying any
-   transcript/translation events, with `status: translating`/`listening`
-   toggled around that work.
+   `SpeechSegmenter` (backend/audio/segmenter.py), which:
+     - fires SPEECH_START when a phrase begins (captured as this phrase's
+       `started_at` timestamp, shared by every message about it),
+     - fires PARTIAL_UPDATE periodically while it continues -- queued as a
+       ("partial", audio, started_at) item, transcribed via the cheaper
+       `provider.transcribe_partial()` and sent as `is_final=False`. A
+       partial identical to the last one sent for this phrase is dropped
+       rather than resent (see "Prevent duplicated phrases" in Step 4).
+     - fires UTTERANCE_READY once the phrase ends -- queued as a
+       ("final", audio, started_at) item, run through the full
+       `provider.process_audio_chunk()` (transcript *and* translation),
+       and sent as `is_final=True`. Only this final version is meant to be
+       kept/stored by the client -- partials are live feedback only.
+   Handoff to either path goes through a queue, not a direct call -- see
+   "Why a queue" below. The background task drains the queue in order
+   (guaranteeing partials for a phrase are always sent before its final),
+   with `status: translating`/`listening` toggled around *final* work only
+   -- partials are cheap enough not to warrant a status flicker.
 4. Client sends `stop`: server flushes whatever phrase was still in
-   progress, lets the background task finish processing whatever's already
-   queued (the socket is still open, so it's worth sending final results),
-   closes the provider session, sends any final events, then
-   `status: connected`.
+   progress (as a final), lets the background task finish processing
+   whatever's already queued (the socket is still open, so it's worth
+   sending final results), closes the provider session, sends any final
+   events, then `status: connected`.
 5. Client disconnects unexpectedly: server *cancels* the background task
    instead of draining it -- see "Drain vs. cancel" below.
 
@@ -72,7 +83,7 @@ pipeline -- see "Testing the microphone pipeline" in the README):
 And independent of that, VAD phrase boundaries are logged at INFO level
 (speech started / an utterance of N seconds was queued), and setting
 DEBUG_AUDIO_DUMP_DIR (see config/settings.py) records both the whole
-session's raw audio (raw.wav) and each individual detected phrase
+session's raw audio (raw.wav) and each individual detected *final* phrase
 (utterance_001.wav, utterance_002.wav, ...) to .wav files -- the latter is
 the direct way to check VAD is placing phrase boundaries correctly (not
 clipping the first word, not fragmenting a sentence on a short pause).
@@ -84,7 +95,7 @@ import asyncio
 import logging
 import time
 import wave
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -117,6 +128,10 @@ GAP_WARNING_SECONDS = 1.0
 
 # Sentinel put on the processing queue to tell the consumer task to stop.
 _STOP = object()
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 async def _safe_send(websocket: WebSocket, payload: str) -> bool:
@@ -156,16 +171,24 @@ def _dump_utterance(session_dir: Path, sample_rate: int, channels: int, index: i
     wf.close()
 
 
-async def _send_events(websocket: WebSocket, events: list[TranslationEvent], target_lang: str, source_lang: str) -> None:
+async def _send_events(
+    websocket: WebSocket, events: list[TranslationEvent], target_lang: str, source_lang: str, timestamp: str
+) -> None:
     for event in events:
         if event.kind == EventKind.TRANSCRIPT:
-            payload = TranscriptMessage(text=event.text, is_final=event.is_final).model_dump_json()
+            payload = TranscriptMessage(
+                text=event.text,
+                is_final=event.is_final,
+                timestamp=timestamp,
+                detected_language=event.detected_language,
+            ).model_dump_json()
         else:
             payload = TranslationMessage(
                 text=event.text,
                 is_final=event.is_final,
                 source_lang=source_lang,
                 target_lang=target_lang,
+                timestamp=timestamp,
             ).model_dump_json()
         if not await _safe_send(websocket, payload):
             return  # client is gone -- no point sending the rest
@@ -186,22 +209,46 @@ async def handle_connection(websocket: WebSocket, settings: Settings) -> None:
     last_frame_at: Optional[float] = None
     last_frame_bytes: Optional[bytes] = None
 
-    # Completed phrases are handed off here immediately; a background task
-    # drains them, so a slow provider call never blocks reading the next
-    # audio frame (or segmenting it) off the socket. See "Why a queue" above.
+    # Timestamp of when the *current* phrase started (set on SPEECH_START,
+    # shared by every partial and the eventual final for that phrase).
+    phrase_started_at: str = _now_iso()
+    # Last partial transcript text actually sent for the current phrase, so
+    # an unchanged re-transcription of the same growing audio isn't resent
+    # (see "Prevent duplicated phrases" in Step 4).
+    last_partial_text: Optional[str] = None
+
+    # Completed phrases (and interim updates) are handed off here
+    # immediately; a background task drains them in order, so a slow
+    # provider call never blocks reading the next audio frame (or
+    # segmenting it) off the socket. See "Why a queue" above. Items are
+    # ("final" | "partial", audio_bytes, started_at_timestamp) tuples.
     queue: "asyncio.Queue" = asyncio.Queue()
     consumer_task: Optional[asyncio.Task] = None
 
     async def consume() -> None:
+        nonlocal last_partial_text
         while True:
             item = await queue.get()
             if item is _STOP:
                 return
+            kind, audio, started_at = item
             try:
+                if kind == "partial":
+                    text = await provider.transcribe_partial(audio)
+                    if text and text != last_partial_text:
+                        last_partial_text = text
+                        await _safe_send(
+                            websocket,
+                            TranscriptMessage(text=text, is_final=False, timestamp=started_at).model_dump_json(),
+                        )
+                    continue
+
+                # kind == "final"
                 if not await _safe_send(websocket, StatusMessage(status="translating").model_dump_json()):
                     continue
-                events = await provider.process_audio_chunk(item)
-                await _send_events(websocket, events, target_lang, source_lang)
+                events = await provider.process_audio_chunk(audio)
+                await _send_events(websocket, events, target_lang, source_lang, started_at)
+                last_partial_text = None
                 if queue.empty():
                     await _safe_send(websocket, StatusMessage(status="listening").model_dump_json())
             except asyncio.CancelledError:
@@ -237,14 +284,18 @@ async def handle_connection(websocket: WebSocket, settings: Settings) -> None:
             logger.exception("Consumer task raised while cancelling")
         consumer_task = None
 
-    def handle_utterance(audio: bytes, sample_rate: int) -> None:
+    def enqueue_final(audio: bytes, sample_rate: int) -> None:
         nonlocal utterance_index
         utterance_index += 1
         duration_s = len(audio) / 2 / settings.audio_channels / sample_rate
         logger.info("VAD: speech ended -- utterance #%d, %.2fs queued for translation", utterance_index, duration_s)
         if debug_session_dir is not None:
             _dump_utterance(debug_session_dir, sample_rate, settings.audio_channels, utterance_index, audio)
-        queue.put_nowait(audio)
+        queue.put_nowait(("final", audio, phrase_started_at))
+
+    def enqueue_partial(audio: bytes) -> None:
+        logger.debug("VAD: partial update -- %d bytes queued for interim transcription", len(audio))
+        queue.put_nowait(("partial", audio, phrase_started_at))
 
     try:
         while True:
@@ -274,12 +325,14 @@ async def handle_connection(websocket: WebSocket, settings: Settings) -> None:
                         pre_speech_ms=settings.vad_pre_speech_ms,
                         end_silence_ms=settings.vad_end_silence_ms,
                         vad_threshold=settings.vad_threshold,
+                        partial_interval_ms=settings.vad_partial_interval_ms,
                     )
                     provider = get_provider(settings)
                     await provider.start_session(source_lang, target_lang)
                     session_active = True
                     last_frame_at = None
                     last_frame_bytes = None
+                    last_partial_text = None
                     utterance_index = 0
                     debug_session_dir = _open_debug_session_dir(settings)
                     raw_dump = (
@@ -294,10 +347,10 @@ async def handle_connection(websocket: WebSocket, settings: Settings) -> None:
                     if session_active and segmenter is not None and provider is not None:
                         remainder = segmenter.flush()
                         if remainder:
-                            handle_utterance(remainder, segmenter.sample_rate)
+                            enqueue_final(remainder, segmenter.sample_rate)
                         await drain_consumer()
                         final_events = await provider.close_session()
-                        await _send_events(websocket, final_events, target_lang, source_lang)
+                        await _send_events(websocket, final_events, target_lang, source_lang, phrase_started_at)
                     if raw_dump is not None:
                         raw_dump.close()
                         raw_dump = None
@@ -332,9 +385,13 @@ async def handle_connection(websocket: WebSocket, settings: Settings) -> None:
 
                 for event in segmenter.push(data):
                     if event.kind == SegmenterEventKind.SPEECH_START:
+                        phrase_started_at = _now_iso()
+                        last_partial_text = None
                         logger.info("VAD: speech started")
+                    elif event.kind == SegmenterEventKind.PARTIAL_UPDATE:
+                        enqueue_partial(event.audio)
                     elif event.kind == SegmenterEventKind.UTTERANCE_READY:
-                        handle_utterance(event.audio, segmenter.sample_rate)
+                        enqueue_final(event.audio, segmenter.sample_rate)
 
     except WebSocketDisconnect:
         logger.info("Client disconnected")

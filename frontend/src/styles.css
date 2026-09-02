@@ -131,17 +131,74 @@ select {
   margin: 0;
 }
 
-.results {
+/* Step 4: chat-style transcript history + live partial line. */
+
+.transcript-panel {
   font-size: 0.9rem;
   background: #f7f8fa;
   border-radius: 8px;
   padding: 12px;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 10px;
+  max-height: 320px;
+  overflow-y: auto;
 }
 
-.results-label {
+.transcript-empty {
+  margin: 0;
+  color: #888;
+  font-size: 0.85rem;
+}
+
+.transcript-entry {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.transcript-line,
+.translation-line {
+  line-height: 1.4;
+}
+
+.translation-line {
+  color: #444;
+}
+
+.transcript-speaker {
   font-weight: 600;
   color: #555;
+}
+
+.transcript-detected-lang {
+  color: #888;
+  font-size: 0.8rem;
+}
+
+/* The phrase still being spoken: visually distinct (dimmer/italic) so it
+   reads as "not settled yet" -- it isn't stored until the final version
+   replaces it in history. */
+.transcript-entry-partial {
+  opacity: 0.65;
+}
+
+.transcript-line-partial {
+  font-style: italic;
+}
+
+.partial-cursor {
+  display: inline-block;
+  width: 2px;
+  height: 0.9em;
+  margin-left: 2px;
+  background: currentColor;
+  vertical-align: text-bottom;
+  animation: partial-cursor-blink 1s step-start infinite;
+}
+
+@keyframes partial-cursor-blink {
+  50% {
+    opacity: 0;
+  }
 }

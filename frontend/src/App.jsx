@@ -15,7 +15,7 @@ export default function App() {
   const [outputId, setOutputId] = useState("");
 
   const { microphones, outputs, permissionError } = useAudioDevices();
-  const { status, transcript, translation, errorMessage, start, stop } = useTranslationSession();
+  const { status, history, livePartial, errorMessage, start, stop } = useTranslationSession();
 
   const isRunning = status !== "idle" && status !== "error";
 
@@ -91,16 +91,40 @@ export default function App() {
 
         <StatusIndicator status={status} errorMessage={errorMessage} />
 
-        {(transcript || translation) && (
-          <div className="results">
-            <div>
-              <span className="results-label">Transcript ({sourceLang}):</span> {transcript}
+        {/* Step 4: chat-style transcript history (final phrases, source +
+            translation) plus a live line for the phrase still being
+            spoken. Only finished phrases (history) are meant to be kept --
+            the live partial is replaced in place and never accumulated. */}
+        <div className="transcript-panel">
+          {history.length === 0 && !livePartial && (
+            <p className="transcript-empty">Your transcript will appear here once you start speaking.</p>
+          )}
+
+          {history.map((entry) => (
+            <div className="transcript-entry" key={entry.timestamp}>
+              <div className="transcript-line">
+                <span className="transcript-speaker">You:</span> {entry.sourceText}
+                {entry.detectedLanguage && (
+                  <span className="transcript-detected-lang"> ({entry.detectedLanguage})</span>
+                )}
+              </div>
+              {entry.translationText && (
+                <div className="translation-line">
+                  <span className="transcript-speaker">{targetLang}:</span> {entry.translationText}
+                </div>
+              )}
             </div>
-            <div>
-              <span className="results-label">Translation ({targetLang}):</span> {translation}
+          ))}
+
+          {livePartial && (
+            <div className="transcript-entry transcript-entry-partial">
+              <div className="transcript-line transcript-line-partial">
+                <span className="transcript-speaker">You:</span> {livePartial.text}
+                <span className="partial-cursor" aria-hidden="true" />
+              </div>
             </div>
-          </div>
-        )}
+          )}
+        </div>
       </div>
     </div>
   );
