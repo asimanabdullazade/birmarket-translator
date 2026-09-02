@@ -59,21 +59,38 @@ class StatusMessage(BaseModel):
 
 
 class TranscriptMessage(BaseModel):
-    """The source-language speech-to-text result (interim or final)."""
+    """The source-language speech-to-text result (interim or final).
+
+    is_final=False ("partial") means speech is still ongoing and this text
+    may still grow or change -- the client should show it but not treat it
+    as settled. is_final=True means the phrase has ended; this is the only
+    version that should be kept/stored (see Step 4: "Only the final version
+    should eventually be stored")."""
 
     type: Literal["transcript"] = "transcript"
     text: str
     is_final: bool
+    # ISO-8601 UTC timestamp of when the *phrase* started (not when this
+    # message was sent) -- shared by every partial and the final message
+    # for the same phrase, so a client can group them and/or show when the
+    # person actually started speaking rather than when processing finished.
+    timestamp: str
+    # Only ever set on a final transcript, and only by providers that
+    # support it (see TranslationEvent.detected_language in
+    # backend/translation/base.py). Informational only.
+    detected_language: Optional[str] = None
 
 
 class TranslationMessage(BaseModel):
-    """The translated text corresponding to a transcript segment."""
+    """The translated text corresponding to a transcript segment. Always
+    final -- only completed phrases are translated (see base.py)."""
 
     type: Literal["translation"] = "translation"
     text: str
     is_final: bool
     source_lang: str
     target_lang: str
+    timestamp: str
 
 
 class ErrorMessage(BaseModel):

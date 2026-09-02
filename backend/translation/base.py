@@ -18,6 +18,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
+from typing import Optional
 
 
 class EventKind(str, Enum):
@@ -30,6 +31,12 @@ class TranslationEvent:
     kind: EventKind
     text: str
     is_final: bool
+    # Only meaningful on TRANSCRIPT events, and only some providers fill it
+    # in (see gemini_provider.py) -- the language the provider itself
+    # detected the audio to be in, independent of the source_lang the user
+    # selected in the UI. Purely informational; never used to override the
+    # user's selection.
+    detected_language: Optional[str] = None
 
 
 class TranslationProvider(ABC):
@@ -42,10 +49,27 @@ class TranslationProvider(ABC):
     @abstractmethod
     async def process_audio_chunk(self, pcm16_bytes: bytes) -> list[TranslationEvent]:
         """
-        Feed one chunk of raw PCM16LE mono audio to the provider and return
-        any transcript/translation events it produced as a result. May
-        return an empty list if the provider is still buffering internally.
+        Feed one *complete* utterance of raw PCM16LE mono audio to the
+        provider and return the transcript/translation events it produced --
+        always treat these as final (is_final=True). May return an empty
+        list if nothing intelligible was heard.
         """
+
+    async def transcribe_partial(self, pcm16_bytes: bytes) -> Optional[str]:
+        """
+        Best-effort interim transcript for a not-yet-finished utterance (the
+        audio captured so far, growing as speech continues). Returns None if
+        unsupported, or if there isn't enough audio yet / nothing
+        intelligible was heard. Default: unsupported -- providers opt in by
+        overriding this.
+
+        Unlike process_audio_chunk, this must NOT translate -- partial
+        results are for live transcript feedback only; only a *final*
+        utterance gets translated. Keep this fast/cheap where possible,
+        since it may be called several times per utterance as speech
+        continues (see VAD_PARTIAL_INTERVAL_MS in config/settings.py).
+        """
+        return None
 
     @abstractmethod
     async def close_session(self) -> list[TranslationEvent]:

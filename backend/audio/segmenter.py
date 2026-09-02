@@ -18,17 +18,23 @@ State machine
   ("...this is... a test") and cutting on the very first quiet moment
   would fragment every phrase into pieces. Silence has to persist for
   `end_silence_ms` (recommended 400-700ms) before the utterance is
-  considered finished.
+  considered finished. While still speaking, a PARTIAL_UPDATE fires every
+  `partial_interval_ms` so callers can get an interim transcript of the
+  phrase-so-far (see Step 4 / backend/websocket/handlers.py) without
+  waiting for the phrase to actually finish.
 
 Frame-level speech/silence classification is delegated to `is_speech()` in
 vad.py (simple RMS-energy-over-threshold); this module is the stateful
-layer on top of it that decides *when a phrase begins and ends*.
+layer on top of it that decides *when a phrase begins and ends* (and, in
+between, how often to surface a look-so-far update).
 
 Usage: one `SpeechSegmenter` per session. Feed every incoming audio frame
-to `push()`, which returns zero or more `SegmenterEvent`s (a SPEECH_START
-when a phrase begins, an UTTERANCE_READY carrying the full phrase's audio
-once enough trailing silence has elapsed). Call `flush()` when the stream
-ends (e.g. on `stop`) to recover whatever phrase was still in progress.
+to `push()`, which returns zero or more `SegmenterEvent`s: a SPEECH_START
+when a phrase begins, zero or more PARTIAL_UPDATEs while it continues (each
+carrying the phrase's audio *so far*), and one UTTERANCE_READY carrying the
+complete phrase's audio once enough trailing silence has elapsed. Call
+`flush()` when the stream ends (e.g. on `stop`) to recover whatever phrase
+was still in progress.
 
 Frames may be any length (each incoming WebSocket frame's actual duration
 is computed from its byte length, sample rate, and channel count) --
@@ -49,6 +55,7 @@ _BYTES_PER_SAMPLE = 2  # PCM16
 
 class SegmenterEventKind(Enum):
     SPEECH_START = "speech_start"
+    PARTIAL_UPDATE = "partial_update"
     UTTERANCE_READY = "utterance_ready"
 
 
@@ -68,12 +75,14 @@ class SpeechSegmenter:
         pre_speech_ms: float = 400.0,
         end_silence_ms: float = 500.0,
         vad_threshold: float = 0.01,
+        partial_interval_ms: float = 700.0,
     ) -> None:
         self.sample_rate = sample_rate
         self.channels = channels
         self.pre_speech_ms = pre_speech_ms
         self.end_silence_ms = end_silence_ms
         self.vad_threshold = vad_threshold
+        self.partial_interval_ms = partial_interval_ms
 
         # Rolling window of (frame, duration_ms) kept while silent, capped
         # by total duration rather than frame count (frames may vary in
@@ -84,6 +93,7 @@ class SpeechSegmenter:
         self._speaking = False
         self._utterance = bytearray()
         self._silence_run_ms = 0.0
+        self._ms_since_partial = 0.0
 
     def _duration_ms(self, frame: bytes) -> float:
         samples = len(frame) / _BYTES_PER_SAMPLE / self.channels
@@ -98,6 +108,7 @@ class SpeechSegmenter:
             if speech_frame:
                 self._speaking = True
                 self._silence_run_ms = 0.0
+                self._ms_since_partial = 0.0
                 self._utterance = bytearray()
                 # Prepend whatever we'd been holding onto during silence --
                 # this is what keeps the first word from being clipped.
@@ -117,6 +128,7 @@ class SpeechSegmenter:
 
         # Currently in a speech segment.
         self._utterance.extend(frame)
+        ended = False
         if speech_frame:
             self._silence_run_ms = 0.0
         else:
@@ -128,8 +140,18 @@ class SpeechSegmenter:
                 self._speaking = False
                 self._utterance = bytearray()
                 self._silence_run_ms = 0.0
+                self._ms_since_partial = 0.0
                 self._pre_speech_buffer.clear()
                 self._pre_speech_total_ms = 0.0
+                ended = True
+
+        if not ended:
+            self._ms_since_partial += duration_ms
+            if self._ms_since_partial >= self.partial_interval_ms:
+                self._ms_since_partial = 0.0
+                events.append(
+                    SegmenterEvent(kind=SegmenterEventKind.PARTIAL_UPDATE, audio=bytes(self._utterance))
+                )
         return events
 
     def flush(self) -> Optional[bytes]:
@@ -144,6 +166,7 @@ class SpeechSegmenter:
         self._speaking = False
         self._utterance = bytearray()
         self._silence_run_ms = 0.0
+        self._ms_since_partial = 0.0
         self._pre_speech_buffer.clear()
         self._pre_speech_total_ms = 0.0
         return audio
