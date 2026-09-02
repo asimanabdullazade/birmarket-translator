@@ -1,12 +1,15 @@
 """
-Server-side audio buffering.
+Server-side audio buffering utilities.
 
-The frontend captures microphone audio with the Web Audio API, resamples it
-to a fixed sample rate, and streams it to the backend as raw PCM16LE mono
-binary WebSocket frames (see frontend/src/audio/audioCapture.js). This
-module accumulates those raw bytes and hands the translation provider
-fixed-size chunks, so provider implementations don't need to think about
-WebSocket framing at all.
+`AudioBuffer`'s fixed-duration chunking (`pop_ready_chunks`/`flush`) is no
+longer used by the WebSocket handler -- audio is now split into phrases by
+detected speech instead, via `backend.audio.segmenter.SpeechSegmenter`,
+which reacts to actual speech/silence rather than translating arbitrary
+time windows regardless of content. `AudioBuffer.to_numpy` is still used
+directly by translation providers (e.g. backend/translation/local_provider.py)
+to convert raw PCM16LE bytes into a float32 array, so the class is kept for
+that; the chunking methods remain here in case a fixed-window mode is ever
+useful again (e.g. a future provider that genuinely wants uniform chunks).
 """
 
 from __future__ import annotations
