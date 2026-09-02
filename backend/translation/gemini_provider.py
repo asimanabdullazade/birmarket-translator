@@ -10,6 +10,12 @@ utterances (see transcribe_partial), a second, cheaper prompt asks for a
 transcript only -- no translation -- since partial results are for live
 feedback and never get translated (see base.py).
 
+The translation instruction (Step 5) is tuned for natural, spoken meeting
+language rather than a formal document translation, and explicitly told to
+preserve numbers/dates/names/company names verbatim -- see
+_transcribe_and_translate's prompt below and "Translation quality" in the
+README.
+
 Requires: settings.gemini_api_key (GEMINI_API_KEY in config/.env). Select
 this provider by setting TRANSLATION_PROVIDER=gemini. You supply your own
 key directly in config/.env -- this code never transmits it anywhere
@@ -162,14 +168,36 @@ class GeminiTranslationProvider(TranslationProvider):
         source_name = _LANGUAGE_NAMES.get(self._source_lang, self._source_lang)
         target_name = _LANGUAGE_NAMES.get(self._target_lang, self._target_lang)
 
+        # Step 5: the translation half of this prompt is deliberately tuned
+        # for *spoken* output, not a formal document translation -- see
+        # "Translation quality" in the README for the reasoning and how to
+        # sanity-check it. Two things matter here: (1) natural/idiomatic
+        # phrasing over a literal word-for-word rendering, since a live
+        # meeting interpreter and a document translator produce
+        # noticeably different output for the same sentence, and (2)
+        # explicit instructions to preserve numbers/dates/names/company
+        # names verbatim rather than risk the model "translating" or
+        # mistranslating something that shouldn't change meaning at all.
         prompt = (
             f"The attached audio is spoken in {source_name}. First transcribe exactly "
             f"what is said, in {source_name}. Then translate that transcript into "
-            f"{target_name}. Also report the spoken language you detected as an ISO "
-            "639-1 two-letter code (e.g. 'en', 'az', 'ru') in detected_language, or "
-            "null if you can't tell. If the audio has no discernible speech (silence, "
-            "noise, just breathing), return an empty string for both transcript and "
-            "translation."
+            f"{target_name}.\n\n"
+            f"Translate the way a skilled human interpreter would in a live business "
+            f"meeting, not the way a document translator would: natural, idiomatic, "
+            f"spoken {target_name}, phrased the way a native {target_name} speaker "
+            f"would actually say it out loud in conversation. Prefer the most natural "
+            f"spoken phrasing over a literal, word-for-word rendering of the source "
+            f"sentence structure -- reorder words, drop filler, or rephrase as needed "
+            f"for that, the way an interpreter does, as long as the meaning stays the "
+            f"same. Avoid stiff, overly formal, or bookish wording.\n\n"
+            f"Keep numbers, dates, times, personal names, and company/product names "
+            f"exactly as they refer to -- never translate, guess at, or alter what "
+            f"they mean (only reformat them into {target_name}'s normal written "
+            f"convention if that differs, e.g. date order or a decimal separator).\n\n"
+            "Also report the spoken language you detected as an ISO 639-1 two-letter "
+            "code (e.g. 'en', 'az', 'ru') in detected_language, or null if you can't "
+            "tell. If the audio has no discernible speech (silence, noise, just "
+            "breathing), return an empty string for both transcript and translation."
         )
         return self._call_gemini(pcm16_bytes, prompt, _TranscriptionResult)
 

@@ -188,6 +188,17 @@ class LocalWhisperNLLBProvider(TranslationProvider):
         return " ".join(segment.text for segment in segments)
 
     def _translate(self, text: str) -> str:
+        # NOTE (Step 5): unlike gemini_provider.py, there's no prompt here --
+        # NLLB is a fixed sequence-to-sequence translation model, not an
+        # instruction-following LLM, so it can't be asked to prefer natural
+        # spoken phrasing over a literal one, or to explicitly preserve
+        # numbers/dates/names verbatim. In practice it's a reasonably
+        # literal, general-purpose MT model: numbers usually survive intact,
+        # but proper nouns can get transliterated or mistranslated, and its
+        # register leans toward standard written language rather than
+        # casual speech. If natural-sounding, spoken-register translation
+        # matters more than staying fully free/local/offline, use
+        # TRANSLATION_PROVIDER=gemini instead.
         translator, tokenizer = _get_nllb(
             self._nllb_model_repo, self._nllb_tokenizer_repo, self._nllb_compute_type
         )
