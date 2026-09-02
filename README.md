@@ -18,8 +18,10 @@ translator/
 │   ├── audio/          AudioBuffer (chunking), simple VAD
 │   ├── translation/    Pluggable TranslationProvider interface
 │   │   ├── base.py           the interface
-│   │   ├── mock_provider.py  default, zero-credential implementation
-│   │   ├── openai_provider.py / azure_provider.py / google_provider.py   stubs
+│   │   ├── gemini_provider.py default: Google Gemini API (needs your own key)
+│   │   ├── local_provider.py  real, free, no key, fully local (faster-whisper + NLLB-200)
+│   │   ├── mock_provider.py  zero-dependency placeholder text, for testing plumbing
+│   │   ├── openai_provider.py / azure_provider.py / google_provider.py   other paid-API stubs
 │   │   └── factory.py        picks a provider from TRANSLATION_PROVIDER
 │   ├── websocket/       Connection manager + per-connection protocol handler
 │   ├── models/          Pydantic message schemas
@@ -45,11 +47,35 @@ translator/
    relays back to the browser as JSON messages, along with status updates
    (`connected` / `listening` / `translating` / `error`).
 
-The app ships with `TRANSLATION_PROVIDER=mock` by default, so **it runs
-end-to-end with no API keys** -- the mock provider uses simple audio-energy
-detection to decide when you're speaking and returns placeholder
-transcript/translation text. Swap in a real provider (see below) when
-you're ready to wire up an actual speech translation API.
+The app ships with `TRANSLATION_PROVIDER=gemini` by default, which sends
+each audio chunk to Google's Gemini API to transcribe and translate in one
+call -- see "Using Gemini" below for how to add your key. Set
+`TRANSLATION_PROVIDER=local` instead for real translation with no API key
+at all (runs on your own CPU, see "Real translation, for free"), or
+`TRANSLATION_PROVIDER=mock` if you just want to exercise the WebSocket/UI
+plumbing without any model or API call -- it returns placeholder text
+based on simple audio-energy detection.
+
+## Using Gemini
+
+1. Get a key at [aistudio.google.com/apikey](https://aistudio.google.com/apikey)
+   (Gemini has a free usage tier).
+2. Paste it into `config/.env` as `GEMINI_API_KEY=...` (copy
+   `config/.env.example` to `config/.env` first if you haven't). That file
+   is git-ignored -- your key won't get committed -- but it's worth a
+   `git status` before your first commit to double check.
+3. `pip install -r backend/requirements.txt` (installs `google-genai`).
+
+Each ~2-second audio chunk (`AUDIO_CHUNK_SECONDS` in `config/.env`) is sent
+to Gemini's native audio understanding with a prompt asking it to
+transcribe in the source language and translate into the target language,
+requesting structured JSON output so both come back reliably. Default
+model is `gemini-flash-latest` (an alias Google keeps pointed at their
+current flash model); override with `GEMINI_MODEL` if you want a specific
+version instead. Note: this uses the SDK's "Interactions" API
+(`client.interactions.create`), which the `google-genai` package itself
+currently flags as experimental -- if a future SDK version changes its
+shape, `gemini_provider.py` is the one file that would need updating.
 
 ## Running it
 
@@ -75,11 +101,43 @@ Open the printed local URL (typically `http://localhost:5173`). Grant
 microphone permission when prompted, pick your languages/devices, and hit
 **Start Translation**.
 
-## Wiring up a real translation API
+## Real translation, for free
+
+`TRANSLATION_PROVIDER=local` (the default) runs two open-source models on
+your own CPU, no account or key required:
+
+- **Speech-to-text:** [faster-whisper](https://github.com/SYSTRAN/faster-whisper),
+  a CTranslate2 build of OpenAI's open-source Whisper model.
+- **Translation:** Meta's open-source [NLLB-200](https://ai.meta.com/research/no-language-left-behind/)
+  (distilled 600M checkpoint), via a pre-converted CTranslate2 model.
+
+**First run only:** both models download from Hugging Face the first time
+the backend actually translates something (i.e. the first WebSocket
+session, not at server startup) -- roughly 150MB for Whisper "base" and
+~1.2GB for NLLB, cached under `~/.cache/huggingface` afterwards. That
+first session will pause for a minute or two while this downloads; every
+session after that (and every subsequent run of the app) reuses the cache
+and starts instantly. This needs a normal, unrestricted internet
+connection for that one download -- if your network blocks
+`huggingface.co` (e.g. a locked-down corporate proxy), switch to
+`TRANSLATION_PROVIDER=mock` to test everything else, or use one of the
+paid providers below instead.
+
+Trade-offs versus a paid vendor API: it's chunk-by-chunk (every
+`AUDIO_CHUNK_SECONDS`, default 2s) rather than true continuous streaming,
+and both latency and accuracy depend on your CPU -- expect noticeably
+slower, rougher results than a managed speech-translation service,
+especially on a laptop without a fast CPU. Tune it via `config/.env`:
+`LOCAL_WHISPER_MODEL_SIZE` (`tiny`/`base`/`small`/`medium`/`large-v3` --
+bigger is slower but more accurate) and `LOCAL_WHISPER_COMPUTE_TYPE` /
+`LOCAL_NLLB_COMPUTE_TYPE` (`int8` is fastest on CPU).
+
+## Wiring up a paid translation API
 
 `backend/translation/base.py` defines the `TranslationProvider` interface
 (`start_session` / `process_audio_chunk` / `close_session`). Three stub
-subclasses are ready to fill in:
+subclasses are ready to fill in once you want a paid, managed service
+instead of the free local one:
 
 - `openai_provider.py` -- OpenAI Realtime API
 - `azure_provider.py` -- Azure Speech Translation (`TranslationRecognizer`)

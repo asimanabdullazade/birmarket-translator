@@ -20,6 +20,26 @@ def get_provider(settings: Settings) -> TranslationProvider:
     if provider_name == "mock":
         return MockTranslationProvider()
 
+    if provider_name == "local":
+        from backend.translation.local_provider import LocalWhisperNLLBProvider
+
+        return LocalWhisperNLLBProvider(
+            whisper_model_size=settings.local_whisper_model_size,
+            whisper_compute_type=settings.local_whisper_compute_type,
+            nllb_model_repo=settings.local_nllb_model_repo,
+            nllb_tokenizer_repo=settings.local_nllb_tokenizer_repo,
+            nllb_compute_type=settings.local_nllb_compute_type,
+        )
+
+    if provider_name == "gemini":
+        from backend.translation.gemini_provider import GeminiTranslationProvider
+
+        return GeminiTranslationProvider(
+            api_key=settings.gemini_api_key,
+            model=settings.gemini_model,
+            sample_rate=settings.audio_sample_rate,
+        )
+
     if provider_name == "openai":
         from backend.translation.openai_provider import OpenAIRealtimeProvider
 
@@ -41,5 +61,5 @@ def get_provider(settings: Settings) -> TranslationProvider:
 
     raise ValueError(
         f"Unknown TRANSLATION_PROVIDER '{settings.translation_provider}'. "
-        "Expected one of: mock, openai, azure, google."
+        "Expected one of: mock, local, gemini, openai, azure, google."
     )

@@ -25,15 +25,34 @@ class Settings(BaseSettings):
     cors_origins: list[str] = ["http://localhost:5173", "http://127.0.0.1:5173"]
 
     # --- Translation provider ---
-    # "mock" works out of the box with no credentials and is the default so
-    # the app is runnable immediately. Set to "openai", "azure", or "google"
-    # (once those providers are implemented) and supply the matching keys.
-    translation_provider: str = "mock"
+    # "gemini" sends each audio chunk to Google's Gemini API (native audio
+    # understanding) for transcription + translation in one call -- see
+    # backend/translation/gemini_provider.py. Needs GEMINI_API_KEY below
+    # (get one at https://aistudio.google.com/apikey; Gemini has a free
+    # usage tier). "local" runs real speech-to-text + translation entirely
+    # on your own machine instead (faster-whisper + Meta's NLLB-200, see
+    # backend/translation/local_provider.py) -- no API key at all, but the
+    # first run downloads ~1.4GB of models and every chunk after that runs
+    # on your CPU. "mock" needs nothing but returns placeholder text, useful
+    # for testing the plumbing without waiting on models or an API call. Set
+    # to "openai", "azure", or "google" for one of the other paid vendor
+    # APIs, and supply the matching key(s) below.
+    translation_provider: str = "gemini"
+
+    gemini_api_key: Optional[str] = None
+    gemini_model: str = "gemini-flash-latest"
 
     openai_api_key: Optional[str] = None
     azure_speech_key: Optional[str] = None
     azure_speech_region: Optional[str] = None
     google_application_credentials: Optional[str] = None
+
+    # --- Local provider (faster-whisper + NLLB-200) ---
+    local_whisper_model_size: str = "base"  # tiny | base | small | medium | large-v3
+    local_whisper_compute_type: str = "int8"  # int8 is fastest on CPU; try "float32" if quality suffers
+    local_nllb_model_repo: str = "entai2965/nllb-200-distilled-600M-ctranslate2"
+    local_nllb_tokenizer_repo: str = "facebook/nllb-200-distilled-600M"
+    local_nllb_compute_type: str = "int8"
 
     # --- Audio ---
     # Must match the sample rate the frontend AudioWorklet resamples/encodes to.

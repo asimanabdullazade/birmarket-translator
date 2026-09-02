@@ -5,3 +5,16 @@ pydantic-settings==2.5.2
 numpy==1.26.4
 websockets==13.1
 python-dotenv==1.0.1
+
+# Gemini translation provider (backend/translation/gemini_provider.py).
+google-genai>=1.0.0
+
+# Local, free translation provider (backend/translation/local_provider.py):
+# speech-to-text via faster-whisper, translation via Meta's NLLB-200.
+# No torch needed -- ctranslate2 does inference, transformers is only used
+# for its tokenizer here.
+faster-whisper>=1.0.0
+ctranslate2>=4.0.0
+transformers>=4.40.0
+sentencepiece>=0.1.99
+huggingface_hub>=0.20.0
