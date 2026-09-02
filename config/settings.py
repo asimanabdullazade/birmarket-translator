@@ -58,8 +58,20 @@ class Settings(BaseSettings):
     # Must match the sample rate the frontend AudioWorklet resamples/encodes to.
     audio_sample_rate: int = 16000
     audio_channels: int = 1
-    # Chunk size (seconds) buffered before a partial-translation pass is triggered.
-    audio_chunk_seconds: float = 2.0
+
+    # --- Voice Activity Detection (VAD) ---
+    # Audio is split into phrases by detected speech, not fixed time
+    # windows -- see backend/audio/segmenter.py. vad_threshold is the same
+    # RMS-energy cutoff used by backend/audio/vad.py's is_speech().
+    # vad_pre_speech_ms is how much audio to keep buffered *before* speech
+    # is detected, so the first word/syllable isn't clipped.
+    # vad_end_silence_ms is how long silence must persist before a phrase
+    # is considered finished (400-700ms is a reasonable range: short
+    # enough to feel responsive, long enough not to fragment on a normal
+    # mid-sentence pause).
+    vad_threshold: float = 0.01
+    vad_pre_speech_ms: float = 400.0
+    vad_end_silence_ms: float = 500.0
 
     # --- Logging ---
     log_level: str = "INFO"

@@ -2,7 +2,7 @@
 Per-connection protocol handler.
 
 This is the piece that ties everything together: it reads control/audio
-frames off one WebSocket, drives an `AudioBuffer` (backend/audio) and a
+frames off one WebSocket, drives a `SpeechSegmenter` (backend/audio) and a
 `TranslationProvider` (backend/translation), and writes status/transcript/
 translation frames back, per the protocol defined in backend/models/schemas.py.
 
@@ -11,18 +11,20 @@ Message flow
 1. Client connects; server sends `status: connected`.
 2. Client sends a `start` message with source_lang/target_lang.
    Server opens a provider session, starts a background task to process
-   buffered audio, and sends `status: listening`.
-3. Client streams binary PCM16LE audio frames. Each frame is buffered;
-   once enough audio has accumulated, the chunk is handed off to a queue
-   -- *not* processed inline -- so reading the next incoming frame never
-   waits on a slow provider call (see "Why a queue" below). The background
-   task drains the queue, calling the provider and relaying any
+   completed phrases, and sends `status: listening`.
+3. Client streams binary PCM16LE audio frames. Each frame is fed to a
+   `SpeechSegmenter`, which decides *when a phrase begins and ends* (see
+   backend/audio/segmenter.py) -- only complete phrases are handed off for
+   translation, not silence or arbitrary fixed-size windows. Handoff goes
+   through a queue, not a direct call -- see "Why a queue" below. The
+   background task drains the queue, calling the provider and relaying any
    transcript/translation events, with `status: translating`/`listening`
    toggled around that work.
-4. Client sends `stop`: server flushes remaining audio, lets the
-   background task finish processing whatever's already queued (the
-   socket is still open, so it's worth sending final results), closes the
-   provider session, sends any final events, then `status: connected`.
+4. Client sends `stop`: server flushes whatever phrase was still in
+   progress, lets the background task finish processing whatever's already
+   queued (the socket is still open, so it's worth sending final results),
+   closes the provider session, sends any final events, then
+   `status: connected`.
 5. Client disconnects unexpectedly: server *cancels* the background task
    instead of draining it -- see "Drain vs. cancel" below.
 
@@ -31,54 +33,49 @@ the socket, so the client can show it and try again without reconnecting.
 
 Why a queue
 -----------
-Earlier versions called `await provider.process_audio_chunk(chunk)` right
-in the same loop that reads frames off the socket. That's fine with the
-"mock" provider (near-instant), but with a real provider (a Gemini API
-round-trip, or CPU-bound local Whisper/NLLB inference) that await can take
-seconds -- during which this connection's task wasn't calling
-`websocket.receive()` at all. Audio kept arriving from the browser the
-whole time, but sat unread in the OS socket buffer, which then looks
-exactly like a capture "gap" once it's finally read, even though the
-browser never stopped sending. Moving provider calls onto a background
-task fed by a queue keeps the read loop free to keep up with the incoming
-stream regardless of how slow any single translation call is.
+Calling `await provider.process_audio_chunk(...)` right in the loop that
+reads frames off the socket would mean a slow provider call (a Gemini API
+round-trip, or CPU-bound local Whisper/NLLB inference) blocks reading the
+*next* incoming frame -- audio would keep arriving from the browser but sit
+unread in the OS socket buffer, which then looks exactly like a capture
+gap even though the browser never stopped sending. Moving provider calls
+onto a background task fed by a queue keeps the read loop free to keep up
+with the incoming stream (and keep segmenting it correctly) regardless of
+how slow any single translation call is.
 
 Drain vs. cancel
 ----------------
-That queue can build up a backlog if the provider is slower than the
-audio arrives (exactly what a Gemini/local-model round-trip can cause).
-On a clean `stop`, the socket is still open, so it's worth letting the
-background task finish that backlog and send final results -- that's
-`_drain_consumer()`. But if the client disconnects instead, the socket is
-already dead: draining would mean the task keeps calling the (possibly
-slow, possibly paid) provider and then trying to send on a closed socket
-for every backlogged chunk, which is both wasted work and -- as seen in
-practice -- floods the log with "Cannot call send once a close message
-has been sent" errors once the first send fails. So a real disconnect
-instead calls `_cancel_consumer()`, which cancels the task immediately and
-discards whatever was still queued. Every send anywhere in this module
-also goes through `_safe_send`, which swallows the (expected, benign) case
-of the client already being gone rather than raising.
+That queue can build up a backlog if the provider is slower than phrases
+arrive. On a clean `stop`, the socket is still open, so it's worth letting
+the background task finish that backlog and send final results -- that's
+`drain_consumer()`. But if the client disconnects instead, the socket is
+already dead: draining would mean the task keeps calling the provider and
+then trying to send on a closed socket for every backlogged item, which is
+wasted work and floods the log with send-on-closed-socket errors. A real
+disconnect instead calls `cancel_consumer()`, which cancels the task
+immediately and discards whatever was still queued. Every send anywhere in
+this module goes through `_safe_send`, which swallows the (expected,
+benign) case of the client already being gone rather than raising.
 
-Mic-capture diagnostics
-------------------------
-Two lightweight checks run on every incoming binary frame, independent of
-whatever TRANSLATION_PROVIDER is selected -- useful for verifying the raw
-capture/streaming pipeline (see the "Testing the microphone pipeline"
-section in the README) before worrying about translation quality at all:
+Diagnostics
+-----------
+Independent of VAD, two lightweight transport-level checks run on every
+incoming binary frame (useful for verifying the raw capture/streaming
+pipeline -- see "Testing the microphone pipeline" in the README):
 
 - Gap detection: warns if too long passes between two consecutive frames
-  actually being read off the socket (see "Why a queue" above for why that
-  now reflects real capture/network gaps rather than provider latency).
+  actually being read off the socket.
 - Duplicate detection: warns if a frame is byte-for-byte identical to the
-  one immediately before it *and* contains speech. (Silence legitimately
-  repeats byte-for-byte -- two all-zero chunks are not a bug -- so the
-  check ignores silent frames via the same VAD used by translation
-  providers to skip silence.)
+  one immediately before it *and* contains speech (silence legitimately
+  repeats byte-for-byte, so silent frames are exempt).
 
-Additionally, setting DEBUG_AUDIO_DUMP_DIR (see config/settings.py) records
-each session's raw incoming audio to a .wav file so you can listen back to
-exactly what the backend received.
+And independent of that, VAD phrase boundaries are logged at INFO level
+(speech started / an utterance of N seconds was queued), and setting
+DEBUG_AUDIO_DUMP_DIR (see config/settings.py) records both the whole
+session's raw audio (raw.wav) and each individual detected phrase
+(utterance_001.wav, utterance_002.wav, ...) to .wav files -- the latter is
+the direct way to check VAD is placing phrase boundaries correctly (not
+clipping the first word, not fragmenting a sentence on a short pause).
 """
 
 from __future__ import annotations
@@ -94,7 +91,7 @@ from typing import Optional
 from fastapi import WebSocket, WebSocketDisconnect
 from pydantic import ValidationError
 
-from backend.audio.processor import AudioBuffer
+from backend.audio.segmenter import SegmenterEventKind, SpeechSegmenter
 from backend.audio.vad import is_speech
 from backend.models.schemas import (
     ErrorMessage,
@@ -136,18 +133,27 @@ async def _safe_send(websocket: WebSocket, payload: str) -> bool:
         return False
 
 
-def _open_debug_dump(settings: Settings, sample_rate: int) -> Optional[wave.Wave_write]:
+def _open_debug_session_dir(settings: Settings) -> Optional[Path]:
     if not settings.debug_audio_dump_dir:
         return None
-    directory = Path(settings.debug_audio_dump_dir)
-    directory.mkdir(parents=True, exist_ok=True)
-    filename = directory / f"session_{datetime.now():%Y%m%d_%H%M%S}.wav"
-    wf = wave.open(str(filename), "wb")
-    wf.setnchannels(settings.audio_channels)
+    session_dir = Path(settings.debug_audio_dump_dir) / f"session_{datetime.now():%Y%m%d_%H%M%S}"
+    session_dir.mkdir(parents=True, exist_ok=True)
+    logger.info("Recording debug audio for this session to %s", session_dir)
+    return session_dir
+
+
+def _open_wav(path: Path, sample_rate: int, channels: int) -> wave.Wave_write:
+    wf = wave.open(str(path), "wb")
+    wf.setnchannels(channels)
     wf.setsampwidth(2)  # PCM16
     wf.setframerate(sample_rate)
-    logger.info("Recording raw incoming audio to %s", filename)
     return wf
+
+
+def _dump_utterance(session_dir: Path, sample_rate: int, channels: int, index: int, audio: bytes) -> None:
+    wf = _open_wav(session_dir / f"utterance_{index:03d}.wav", sample_rate, channels)
+    wf.writeframes(audio)
+    wf.close()
 
 
 async def _send_events(websocket: WebSocket, events: list[TranslationEvent], target_lang: str, source_lang: str) -> None:
@@ -168,19 +174,21 @@ async def _send_events(websocket: WebSocket, events: list[TranslationEvent], tar
 async def handle_connection(websocket: WebSocket, settings: Settings) -> None:
     await websocket.send_text(StatusMessage(status="connected").model_dump_json())
 
-    audio_buffer: Optional[AudioBuffer] = None
+    segmenter: Optional[SpeechSegmenter] = None
     provider = None
     source_lang = ""
     target_lang = ""
     session_active = False
 
-    debug_dump: Optional[wave.Wave_write] = None
+    debug_session_dir: Optional[Path] = None
+    raw_dump: Optional[wave.Wave_write] = None
+    utterance_index = 0
     last_frame_at: Optional[float] = None
     last_frame_bytes: Optional[bytes] = None
 
-    # Chunks ready for translation are handed off here immediately; a
-    # background task drains them, so a slow provider call never blocks
-    # reading the next audio frame off the socket. See "Why a queue" above.
+    # Completed phrases are handed off here immediately; a background task
+    # drains them, so a slow provider call never blocks reading the next
+    # audio frame (or segmenting it) off the socket. See "Why a queue" above.
     queue: "asyncio.Queue" = asyncio.Queue()
     consumer_task: Optional[asyncio.Task] = None
 
@@ -199,7 +207,7 @@ async def handle_connection(websocket: WebSocket, settings: Settings) -> None:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                logger.exception("Error while processing a buffered audio chunk")
+                logger.exception("Error while processing a buffered utterance")
 
     async def drain_consumer() -> None:
         """Clean `stop`: socket is still open, so finish the backlog and
@@ -229,6 +237,15 @@ async def handle_connection(websocket: WebSocket, settings: Settings) -> None:
             logger.exception("Consumer task raised while cancelling")
         consumer_task = None
 
+    def handle_utterance(audio: bytes, sample_rate: int) -> None:
+        nonlocal utterance_index
+        utterance_index += 1
+        duration_s = len(audio) / 2 / settings.audio_channels / sample_rate
+        logger.info("VAD: speech ended -- utterance #%d, %.2fs queued for translation", utterance_index, duration_s)
+        if debug_session_dir is not None:
+            _dump_utterance(debug_session_dir, sample_rate, settings.audio_channels, utterance_index, audio)
+        queue.put_nowait(audio)
+
     try:
         while True:
             message = await websocket.receive()
@@ -251,38 +268,44 @@ async def handle_connection(websocket: WebSocket, settings: Settings) -> None:
                         continue
 
                     source_lang, target_lang = parsed.source_lang, parsed.target_lang
-                    audio_buffer = AudioBuffer(
+                    segmenter = SpeechSegmenter(
                         sample_rate=parsed.sample_rate,
                         channels=settings.audio_channels,
-                        chunk_seconds=settings.audio_chunk_seconds,
+                        pre_speech_ms=settings.vad_pre_speech_ms,
+                        end_silence_ms=settings.vad_end_silence_ms,
+                        vad_threshold=settings.vad_threshold,
                     )
                     provider = get_provider(settings)
                     await provider.start_session(source_lang, target_lang)
                     session_active = True
                     last_frame_at = None
                     last_frame_bytes = None
-                    debug_dump = _open_debug_dump(settings, parsed.sample_rate)
+                    utterance_index = 0
+                    debug_session_dir = _open_debug_session_dir(settings)
+                    raw_dump = (
+                        _open_wav(debug_session_dir / "raw.wav", parsed.sample_rate, settings.audio_channels)
+                        if debug_session_dir is not None
+                        else None
+                    )
                     consumer_task = asyncio.create_task(consume())
                     await _safe_send(websocket, StatusMessage(status="listening").model_dump_json())
 
                 elif isinstance(parsed, StopMessage):
-                    if session_active and audio_buffer is not None and provider is not None:
-                        remainder = audio_buffer.flush()
+                    if session_active and segmenter is not None and provider is not None:
+                        remainder = segmenter.flush()
                         if remainder:
-                            if debug_dump is not None:
-                                debug_dump.writeframes(remainder)
-                            await queue.put(remainder)
+                            handle_utterance(remainder, segmenter.sample_rate)
                         await drain_consumer()
                         final_events = await provider.close_session()
                         await _send_events(websocket, final_events, target_lang, source_lang)
-                    if debug_dump is not None:
-                        debug_dump.close()
-                        debug_dump = None
+                    if raw_dump is not None:
+                        raw_dump.close()
+                        raw_dump = None
                     session_active = False
                     await _safe_send(websocket, StatusMessage(status="connected").model_dump_json())
 
             elif "bytes" in message and message["bytes"] is not None:
-                if not session_active or audio_buffer is None or provider is None:
+                if not session_active or segmenter is None or provider is None:
                     await _safe_send(
                         websocket, ErrorMessage(message="Received audio before a start message").model_dump_json()
                     )
@@ -304,12 +327,14 @@ async def handle_connection(websocket: WebSocket, settings: Settings) -> None:
                     )
                 last_frame_bytes = data
 
-                if debug_dump is not None:
-                    debug_dump.writeframes(data)
+                if raw_dump is not None:
+                    raw_dump.writeframes(data)
 
-                audio_buffer.add(data)
-                for chunk in audio_buffer.pop_ready_chunks():
-                    await queue.put(chunk)
+                for event in segmenter.push(data):
+                    if event.kind == SegmenterEventKind.SPEECH_START:
+                        logger.info("VAD: speech started")
+                    elif event.kind == SegmenterEventKind.UTTERANCE_READY:
+                        handle_utterance(event.audio, segmenter.sample_rate)
 
     except WebSocketDisconnect:
         logger.info("Client disconnected")
@@ -319,8 +344,8 @@ async def handle_connection(websocket: WebSocket, settings: Settings) -> None:
         await _safe_send(websocket, StatusMessage(status="error", detail=str(exc)).model_dump_json())
     finally:
         await cancel_consumer()
-        if debug_dump is not None:
-            debug_dump.close()
+        if raw_dump is not None:
+            raw_dump.close()
         if session_active and provider is not None:
             try:
                 await provider.close_session()
