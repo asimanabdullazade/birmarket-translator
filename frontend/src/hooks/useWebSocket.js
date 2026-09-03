@@ -1,6 +1,7 @@
 import { useCallback, useRef, useState } from "react";
 import { BACKEND_WS_URL, AUDIO_SAMPLE_RATE } from "../config.js";
 import { MicCapture } from "../audio/audioCapture.js";
+import { TranslationAudioPlayer } from "../audio/audioPlayback.js";
 
 /**
  * Owns the WebSocket connection, the mic capture pipeline, and the
@@ -22,15 +23,34 @@ import { MicCapture } from "../audio/audioCapture.js";
  *   arrive for the same phrase (never appended/accumulated), and cleared
  *   once that phrase's final transcript shows up -- at which point the text
  *   lives in `history` instead.
+ *
+ * Translation audio playback (Step 6)
+ * ------------------------------------
+ * `audio` messages (one or more per finished phrase, streamed as each
+ * chunk is synthesized -- see backend/websocket/handlers.py) are handed
+ * straight to a `TranslationAudioPlayer` (audio/audioPlayback.js), which
+ * queues and plays them back to back with no overlap. `volume` and
+ * `muted` control that player's GainNode; `muted` is also sent to the
+ * server as a `set_muted` message so it can skip the TTS call entirely
+ * rather than synthesizing audio nobody will hear.
  */
 export function useTranslationSession() {
   const [status, setStatus] = useState("idle"); // idle | connected | listening | translating | error
   const [history, setHistory] = useState([]);
   const [livePartial, setLivePartial] = useState(null); // { timestamp, text } | null
   const [errorMessage, setErrorMessage] = useState(null);
+  const [volume, setVolumeState] = useState(1);
+  const [muted, setMutedState] = useState(false);
 
   const socketRef = useRef(null);
   const micRef = useRef(null);
+  const playerRef = useRef(null);
+  if (!playerRef.current) {
+    playerRef.current = new TranslationAudioPlayer();
+  }
+  // Mirrors `muted` for code that can't wait for a re-render (the `start`
+  // callback's `onopen` closure, captured once per call) -- see `start` below.
+  const mutedRef = useRef(false);
 
   // Create-or-update the history entry for a given phrase timestamp.
   const upsertEntry = useCallback((timestamp, patch) => {
@@ -48,6 +68,23 @@ export function useTranslationSession() {
     });
   }, []);
 
+  const setVolume = useCallback((nextVolume) => {
+    setVolumeState(nextVolume);
+    playerRef.current.setVolume(nextVolume);
+  }, []);
+
+  const setMuted = useCallback((nextMuted) => {
+    setMutedState(nextMuted);
+    mutedRef.current = nextMuted;
+    playerRef.current.setMuted(nextMuted);
+    // Also tell the server, mid-session, so it can skip the TTS call
+    // entirely rather than synthesizing audio we're about to discard --
+    // see SetMutedMessage in backend/models/schemas.py.
+    if (socketRef.current?.readyState === WebSocket.OPEN) {
+      socketRef.current.send(JSON.stringify({ type: "set_muted", muted: nextMuted }));
+    }
+  }, []);
+
   const stop = useCallback(() => {
     if (socketRef.current?.readyState === WebSocket.OPEN) {
       socketRef.current.send(JSON.stringify({ type: "stop" }));
@@ -57,6 +94,8 @@ export function useTranslationSession() {
 
     micRef.current?.stop();
     micRef.current = null;
+
+    playerRef.current.stop();
 
     setStatus("idle");
   }, []);
@@ -79,6 +118,14 @@ export function useTranslationSession() {
             sample_rate: AUDIO_SAMPLE_RATE,
           })
         );
+        // Sync whatever mute preference carried over from a previous
+        // session (the server always starts a new session unmuted) --
+        // read via the ref, not the `muted` state var, since this closure
+        // was created once when `start` was called and won't see later
+        // re-renders.
+        if (mutedRef.current) {
+          socket.send(JSON.stringify({ type: "set_muted", muted: true }));
+        }
       };
 
       socket.onmessage = (event) => {
@@ -108,6 +155,13 @@ export function useTranslationSession() {
             // Translations are always final -- attach to the matching
             // (existing or not-yet-created) history entry.
             upsertEntry(message.timestamp, { translationText: message.text });
+            break;
+          case "audio":
+            // One synthesized-speech chunk for a translated phrase (Step
+            // 6) -- queue it for gapless playback. Not correlated with
+            // `history` by timestamp for display purposes; the player
+            // handles ordering/overlap on its own.
+            playerRef.current.enqueue(message.audio_base64);
             break;
           case "error":
             setErrorMessage(message.message);
@@ -158,5 +212,5 @@ export function useTranslationSession() {
     [upsertEntry]
   );
 
-  return { status, history, livePartial, errorMessage, start, stop };
+  return { status, history, livePartial, errorMessage, volume, setVolume, muted, setMuted, start, stop };
 }

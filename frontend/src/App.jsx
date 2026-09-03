@@ -3,6 +3,7 @@ import LanguageSelector from "./components/LanguageSelector.jsx";
 import DeviceSelector from "./components/DeviceSelector.jsx";
 import StatusIndicator from "./components/StatusIndicator.jsx";
 import Controls from "./components/Controls.jsx";
+import AudioControls from "./components/AudioControls.jsx";
 import { useAudioDevices } from "./hooks/useAudioDevices.js";
 import { useTranslationSession } from "./hooks/useWebSocket.js";
 import { BACKEND_HTTP_URL, FALLBACK_LANGUAGES } from "./config.js";
@@ -15,7 +16,8 @@ export default function App() {
   const [outputId, setOutputId] = useState("");
 
   const { microphones, outputs, permissionError } = useAudioDevices();
-  const { status, history, livePartial, errorMessage, start, stop } = useTranslationSession();
+  const { status, history, livePartial, errorMessage, volume, setVolume, muted, setMuted, start, stop } =
+    useTranslationSession();
 
   const isRunning = status !== "idle" && status !== "error";
 
@@ -90,6 +92,10 @@ export default function App() {
         <Controls isRunning={isRunning} onStart={handleStart} onStop={stop} startDisabled={!!permissionError} />
 
         <StatusIndicator status={status} errorMessage={errorMessage} />
+
+        {/* Step 6: volume/mute for the incoming synthesized translation
+            audio -- independent of the transcript display below. */}
+        <AudioControls volume={volume} onVolumeChange={setVolume} muted={muted} onToggleMute={setMuted} />
 
         {/* Step 4: chat-style transcript history (final phrases, source +
             translation) plus a live line for the phrase still being

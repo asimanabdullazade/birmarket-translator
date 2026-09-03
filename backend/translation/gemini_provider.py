@@ -16,6 +16,15 @@ preserve numbers/dates/names/company names verbatim -- see
 _transcribe_and_translate's prompt below and "Translation quality" in the
 README.
 
+Step 6 adds speech synthesis of the translated text (synthesize_speech),
+via a *different* API surface than everything above -- Gemini's native
+text-to-speech models go through `client.models.generate_content` with
+`response_modalities=["AUDIO"]`, not the Interactions API used for
+transcription/translation. This hasn't been exercised against the live
+API from inside this project's dev sandbox (no network access to Google
+from there) -- see the note above _synthesize_chunk for what to check if
+it errors on your machine.
+
 Requires: settings.gemini_api_key (GEMINI_API_KEY in config/.env). Select
 this provider by setting TRANSLATION_PROVIDER=gemini. You supply your own
 key directly in config/.env -- this code never transmits it anywhere
@@ -35,11 +44,12 @@ import base64
 import io
 import logging
 import wave
-from typing import Optional, Type, TypeVar
+from typing import AsyncIterator, Optional, Type, TypeVar
 
 from pydantic import BaseModel
 
 from backend.translation.base import EventKind, TranslationEvent, TranslationProvider
+from backend.translation.text_chunking import split_for_speech
 from config.languages import SUPPORTED_LANGUAGES
 
 logger = logging.getLogger(__name__)
@@ -47,6 +57,12 @@ logger = logging.getLogger(__name__)
 _LANGUAGE_NAMES = {lang["code"]: lang["name"] for lang in SUPPORTED_LANGUAGES}
 
 _ResultT = TypeVar("_ResultT", bound=BaseModel)
+
+# Gemini's native speech-generation models return raw PCM at a fixed
+# 24kHz/16-bit/mono, regardless of the input audio's own sample rate --
+# see https://ai.google.dev/gemini-api/docs/speech-generation. Unrelated
+# to self._sample_rate (that's the *input* mic audio's rate, used for STT).
+_TTS_SAMPLE_RATE = 24000
 
 
 class _TranscriptionResult(BaseModel):
@@ -63,7 +79,14 @@ class _PartialTranscriptionResult(BaseModel):
 
 
 class GeminiTranslationProvider(TranslationProvider):
-    def __init__(self, api_key: Optional[str], model: str, sample_rate: int) -> None:
+    def __init__(
+        self,
+        api_key: Optional[str],
+        model: str,
+        sample_rate: int,
+        tts_model: str = "gemini-2.5-flash-preview-tts",
+        tts_voice: str = "Kore",
+    ) -> None:
         if not api_key:
             raise ValueError(
                 "GEMINI_API_KEY is required to use the gemini translation provider. "
@@ -89,6 +112,8 @@ class GeminiTranslationProvider(TranslationProvider):
         self._AudioContent = AudioContent
         self._model = model
         self._sample_rate = sample_rate
+        self._tts_model = tts_model
+        self._tts_voice = tts_voice
         self._source_lang = "en"
         self._target_lang = "az"
 
@@ -124,6 +149,13 @@ class GeminiTranslationProvider(TranslationProvider):
             return None
         transcript = result.transcript.strip()
         return transcript or None
+
+    async def synthesize_speech(self, text: str) -> AsyncIterator[tuple[bytes, int]]:
+        loop = asyncio.get_event_loop()
+        for chunk in split_for_speech(text):
+            pcm = await loop.run_in_executor(None, self._synthesize_chunk, chunk)
+            if pcm:
+                yield pcm, _TTS_SAMPLE_RATE
 
     async def close_session(self) -> list[TranslationEvent]:
         return []
@@ -217,6 +249,80 @@ class GeminiTranslationProvider(TranslationProvider):
             "an empty string."
         )
         return self._call_gemini(pcm16_bytes, prompt, _PartialTranscriptionResult)
+
+    def _synthesize_chunk(self, text: str) -> Optional[bytes]:
+        """
+        Step 6, best-effort: calls Gemini's native text-to-speech model.
+        This is a *different* API surface than _call_gemini's Interactions
+        API above -- speech generation currently goes through
+        `client.models.generate_content` with `response_modalities=["AUDIO"]`
+        and a `speech_config` picking a prebuilt voice. The model speaks
+        whatever language the input text is written in (no separate
+        language parameter needed) -- since `text` here is already the
+        *translated* text, it comes out in the target language.
+
+        `contents` is deliberately NOT just the raw text. Handing a TTS-only
+        model the bare translated phrase on its own (e.g. "Sure, that
+        works." or "Yes.") sometimes reads to it as something to *reply to*
+        rather than read aloud, and it tries to respond in text -- which a
+        response_modalities=["AUDIO"] request isn't allowed to return, so
+        Google rejects the whole call with a 400 ("Model tried to generate
+        text, but it should only be used for TTS..."). Wrapping the text in
+        an explicit "say exactly this" instruction is Google's own
+        documented pattern for these models
+        (https://ai.google.dev/gemini-api/docs/speech-generation) and keeps
+        it in "read this aloud verbatim" mode instead.
+
+        Confirmed against the live API (previously this couldn't be tested
+        from the dev sandbox, which has no network access to Google's
+        API) -- if it still errors on your machine, check
+        GEMINI_TTS_MODEL/GEMINI_TTS_VOICE in config/.env against the
+        current model names and voice list at the URL above. Either way, a
+        failure here is caught and logged, never raised -- a chunk that
+        fails to synthesize just isn't spoken; it doesn't break
+        transcription/translation, which already succeeded by the time
+        this runs.
+
+        One failure mode you may still see and can ignore: Google's free
+        tier currently caps this specific TTS model at 3 requests/minute
+        (a 429 RESOURCE_EXHAUSTED, "quota exceeded ... limit: 3"). That's
+        an account-level rate limit, not a bug -- it just means a chunk or
+        two goes unspoken if you talk faster than that. It resolves itself
+        after the minute rolls over, or by enabling billing on the Google
+        AI Studio project for a higher quota.
+        """
+        try:
+            from google.genai import types
+
+            response = self._client.models.generate_content(
+                model=self._tts_model,
+                contents=f"Say exactly the following, and nothing else: {text}",
+                config=types.GenerateContentConfig(
+                    response_modalities=["AUDIO"],
+                    speech_config=types.SpeechConfig(
+                        voice_config=types.VoiceConfig(
+                            prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=self._tts_voice)
+                        )
+                    ),
+                ),
+            )
+            candidates = response.candidates or []
+            if not candidates or candidates[0].content is None or not candidates[0].content.parts:
+                # Seen (rarely) with no clear error -- e.g. the model
+                # declining for a safety/policy reason on this specific
+                # chunk. finish_reason (if present) is the best clue;
+                # logged as a warning rather than raised, same as every
+                # other failure path here.
+                finish_reason = getattr(candidates[0], "finish_reason", None) if candidates else None
+                logger.warning(
+                    "Gemini speech-generation returned no audio for a translated chunk (finish_reason=%s)",
+                    finish_reason,
+                )
+                return None
+            return candidates[0].content.parts[0].inline_data.data
+        except Exception:
+            logger.exception("Gemini speech-generation request failed for a translated chunk")
+            return None
 
     def _pcm16_to_wav(self, pcm16_bytes: bytes) -> bytes:
         buf = io.BytesIO()

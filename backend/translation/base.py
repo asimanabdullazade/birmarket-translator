@@ -18,7 +18,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional
+from typing import AsyncIterator, Optional
 
 
 class EventKind(str, Enum):
@@ -70,6 +70,30 @@ class TranslationProvider(ABC):
         continues (see VAD_PARTIAL_INTERVAL_MS in config/settings.py).
         """
         return None
+
+    async def synthesize_speech(self, text: str) -> AsyncIterator[tuple[bytes, int]]:
+        """
+        Convert already-*translated* text to speech (Step 6), yielding
+        (pcm16le_mono_audio_bytes, sample_rate) tuples -- one per speakable
+        chunk (see text_chunking.split_for_speech) -- as soon as each is
+        ready. `websocket/handlers.py` streams each chunk to the client
+        immediately as it's yielded, rather than waiting for the whole
+        phrase, so playback of the first chunk can start before later
+        chunks (or even later words in the same sentence) have finished
+        synthesizing -- see "Start playback before the entire sentence is
+        generated" in Step 6.
+
+        Only ever called with a *final* translation -- there's no such
+        thing as speaking a partial/still-changing translation aloud (and
+        partial results are never translated in the first place, see
+        transcribe_partial above).
+
+        Default: unsupported -- yields nothing. Providers opt in by
+        overriding this (see gemini_provider.py; local_provider.py
+        deliberately does not -- see the note in that file for why).
+        """
+        return
+        yield b"", 0  # pragma: no cover -- unreachable; makes this an async generator
 
     @abstractmethod
     async def close_session(self) -> list[TranslationEvent]:
