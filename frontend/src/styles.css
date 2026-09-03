@@ -131,6 +131,47 @@ select {
   margin: 0;
 }
 
+/* Step 6: volume/mute for the synthesized translation audio. */
+
+.audio-controls {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 0.85rem;
+}
+
+.audio-controls .field-label {
+  white-space: nowrap;
+}
+
+.audio-controls input[type="range"] {
+  flex: 1;
+  accent-color: #2f7d3f;
+}
+
+.audio-controls input[type="range"]:disabled {
+  accent-color: #9aa0a6;
+  opacity: 0.6;
+}
+
+.btn-mute {
+  padding: 6px 12px;
+  border-radius: 8px;
+  border: 1px solid #ccced4;
+  background: #fff;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: #1c1e21;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.btn-mute-active {
+  background: #b3261e;
+  border-color: #b3261e;
+  color: #fff;
+}
+
 /* Step 4: chat-style transcript history + live partial line. */
 
 .transcript-panel {

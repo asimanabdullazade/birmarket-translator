@@ -31,6 +31,12 @@ Message flow
    (guaranteeing partials for a phrase are always sent before its final),
    with `status: translating`/`listening` toggled around *final* work only
    -- partials are cheap enough not to warrant a status flicker.
+   Immediately after a final translation is sent, its text is also handed
+   to `provider.synthesize_speech()` (Step 6) -- each synthesized audio
+   chunk is streamed to the client as its own `audio` message as soon as
+   it's ready (not batched), so playback of the first chunk can start
+   before later ones finish synthesizing. This is skipped entirely while
+   the client has sent `set_muted: true`, saving the TTS call.
 4. Client sends `stop`: server flushes whatever phrase was still in
    progress (as a final), lets the background task finish processing
    whatever's already queued (the socket is still open, so it's worth
@@ -38,6 +44,11 @@ Message flow
    events, then `status: connected`.
 5. Client disconnects unexpectedly: server *cancels* the background task
    instead of draining it -- see "Drain vs. cancel" below.
+6. Client sends `set_muted` at any point during an active session to
+   toggle Step 6's speech synthesis on/off server-side. Independent of the
+   client's own playback volume/mute (see "Translation audio playback" in
+   the README) -- this one is purely about not spending a TTS call on
+   audio the client has already said it won't play.
 
 Errors at any step are reported as an `error` message rather than closing
 the socket, so the client can show it and try again without reconnecting.
@@ -92,6 +103,8 @@ clipping the first word, not fragmenting a sentence on a short pause).
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
 import logging
 import time
 import wave
@@ -105,7 +118,9 @@ from pydantic import ValidationError
 from backend.audio.segmenter import SegmenterEventKind, SpeechSegmenter
 from backend.audio.vad import is_speech
 from backend.models.schemas import (
+    AudioMessage,
     ErrorMessage,
+    SetMutedMessage,
     StartMessage,
     StatusMessage,
     StopMessage,
@@ -113,7 +128,7 @@ from backend.models.schemas import (
     TranslationMessage,
     parse_client_message,
 )
-from backend.translation.base import EventKind, TranslationEvent
+from backend.translation.base import EventKind, TranslationEvent, TranslationProvider
 from backend.translation.factory import get_provider
 from config.languages import is_supported
 from config.settings import Settings
@@ -194,6 +209,45 @@ async def _send_events(
             return  # client is gone -- no point sending the rest
 
 
+def _pcm16_to_wav_bytes(pcm16_bytes: bytes, sample_rate: int, channels: int = 1) -> bytes:
+    """Wrap raw PCM16LE audio in a WAV header, in memory -- so the client
+    can hand it straight to the browser's decodeAudioData instead of
+    needing to know the sample rate/format out of band (Step 6)."""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(channels)
+        wf.setsampwidth(2)  # PCM16
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm16_bytes)
+    return buf.getvalue()
+
+
+async def _stream_tts(websocket: WebSocket, provider: TranslationProvider, text: str, timestamp: str) -> None:
+    """Synthesize `text` (a final translation) to speech and stream each
+    ready chunk to the client immediately as an `audio` message (Step 6),
+    rather than collecting the whole thing first -- see
+    TranslationProvider.synthesize_speech in base.py for why this is a
+    streaming call. A synthesis failure is logged and simply means less
+    audio gets played; it never propagates up and breaks the rest of the
+    pipeline (transcription/translation already succeeded by the time
+    this runs)."""
+    try:
+        async for pcm_chunk, sample_rate in provider.synthesize_speech(text):
+            if not pcm_chunk:
+                continue
+            payload = AudioMessage(
+                audio_base64=base64.b64encode(_pcm16_to_wav_bytes(pcm_chunk, sample_rate)).decode("ascii"),
+                sample_rate=sample_rate,
+                timestamp=timestamp,
+            ).model_dump_json()
+            if not await _safe_send(websocket, payload):
+                return
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("Error while synthesizing/streaming translated speech")
+
+
 async def handle_connection(websocket: WebSocket, settings: Settings) -> None:
     await websocket.send_text(StatusMessage(status="connected").model_dump_json())
 
@@ -216,6 +270,10 @@ async def handle_connection(websocket: WebSocket, settings: Settings) -> None:
     # an unchanged re-transcription of the same growing audio isn't resent
     # (see "Prevent duplicated phrases" in Step 4).
     last_partial_text: Optional[str] = None
+    # Step 6: skip calling the TTS provider entirely while the client has
+    # muted translation audio, rather than synthesizing speech nobody will
+    # hear. Set via a `set_muted` message, independent of `start`/`stop`.
+    translation_muted = False
 
     # Completed phrases (and interim updates) are handed off here
     # immediately; a background task drains them in order, so a slow
@@ -249,6 +307,14 @@ async def handle_connection(websocket: WebSocket, settings: Settings) -> None:
                 events = await provider.process_audio_chunk(audio)
                 await _send_events(websocket, events, target_lang, source_lang, started_at)
                 last_partial_text = None
+
+                if not translation_muted:
+                    translation_text = next(
+                        (event.text for event in events if event.kind == EventKind.TRANSLATION), ""
+                    )
+                    if translation_text:
+                        await _stream_tts(websocket, provider, translation_text, started_at)
+
                 if queue.empty():
                     await _safe_send(websocket, StatusMessage(status="listening").model_dump_json())
             except asyncio.CancelledError:
@@ -333,6 +399,7 @@ async def handle_connection(websocket: WebSocket, settings: Settings) -> None:
                     last_frame_at = None
                     last_frame_bytes = None
                     last_partial_text = None
+                    translation_muted = False
                     utterance_index = 0
                     debug_session_dir = _open_debug_session_dir(settings)
                     raw_dump = (
@@ -356,6 +423,10 @@ async def handle_connection(websocket: WebSocket, settings: Settings) -> None:
                         raw_dump = None
                     session_active = False
                     await _safe_send(websocket, StatusMessage(status="connected").model_dump_json())
+
+                elif isinstance(parsed, SetMutedMessage):
+                    translation_muted = parsed.muted
+                    logger.info("Translation audio %s", "muted" if translation_muted else "unmuted")
 
             elif "bytes" in message and message["bytes"] is not None:
                 if not session_active or segmenter is None or provider is None:

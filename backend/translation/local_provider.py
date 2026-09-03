@@ -32,7 +32,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
-from typing import Optional
+from typing import AsyncIterator, Optional
 
 import numpy as np
 
@@ -165,6 +165,21 @@ class LocalWhisperNLLBProvider(TranslationProvider):
         # newest bit of it. Fine for the short phrases this app targets.
         transcript = (await loop.run_in_executor(None, self._transcribe, audio)).strip()
         return transcript or None
+
+    async def synthesize_speech(self, text: str) -> AsyncIterator[tuple[bytes, int]]:
+        # Deliberately not implemented (Step 6): there's no good, actually-
+        # free offline TTS engine with real Azerbaijani/Russian voice
+        # support to match this provider's free/local/no-API-key promise --
+        # the common offline options (e.g. pyttsx3) only speak whatever
+        # voices your OS happens to have installed, which for most systems
+        # means no Azerbaijani at all and patchy Russian. Rather than
+        # silently produce English-accented gibberish for those languages,
+        # this provider simply yields no audio -- the translated text still
+        # shows up in the transcript history either way (see Step 4), it
+        # just isn't spoken aloud. Use TRANSLATION_PROVIDER=gemini for real
+        # synthesized speech.
+        return
+        yield b"", 0  # pragma: no cover -- unreachable; makes this an async generator
 
     async def close_session(self) -> list[TranslationEvent]:
         return []

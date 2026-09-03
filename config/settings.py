@@ -42,6 +42,13 @@ class Settings(BaseSettings):
     gemini_api_key: Optional[str] = None
     gemini_model: str = "gemini-flash-latest"
 
+    # Step 6 (text-to-speech). Google's model naming/availability for
+    # speech generation moves faster than the main chat models -- if this
+    # errors, check https://ai.google.dev/gemini-api/docs/speech-generation
+    # for the current model name and voice list and override here.
+    gemini_tts_model: str = "gemini-2.5-flash-preview-tts"
+    gemini_tts_voice: str = "Kore"
+
     openai_api_key: Optional[str] = None
     azure_speech_key: Optional[str] = None
     azure_speech_region: Optional[str] = None

@@ -38,6 +38,8 @@ def get_provider(settings: Settings) -> TranslationProvider:
             api_key=settings.gemini_api_key,
             model=settings.gemini_model,
             sample_rate=settings.audio_sample_rate,
+            tts_model=settings.gemini_tts_model,
+            tts_voice=settings.gemini_tts_voice,
         )
 
     if provider_name == "openai":

@@ -39,7 +39,23 @@ class StopMessage(BaseModel):
     type: Literal["stop"] = "stop"
 
 
-ClientMessage = Annotated[Union[StartMessage, StopMessage], Field(discriminator="type")]
+class SetMutedMessage(BaseModel):
+    """Toggle whether the server should bother synthesizing translated
+    speech at all (Step 6) -- sent whenever the user clicks the mute
+    button, not just at session start, so it can be flipped mid-
+    conversation. This is a server-side cost/bandwidth optimization (skip
+    calling the TTS provider entirely while muted); it has nothing to do
+    with the client's own volume/mute *playback* control (see
+    frontend/src/audio/audioPlayback.js), which works independently on
+    whatever audio has already been received."""
+
+    type: Literal["set_muted"] = "set_muted"
+    muted: bool
+
+
+ClientMessage = Annotated[
+    Union[StartMessage, StopMessage, SetMutedMessage], Field(discriminator="type")
+]
 
 _client_message_adapter: TypeAdapter[ClientMessage] = TypeAdapter(ClientMessage)
 
@@ -93,9 +109,32 @@ class TranslationMessage(BaseModel):
     timestamp: str
 
 
+class AudioMessage(BaseModel):
+    """One chunk of synthesized speech audio for a translated phrase
+    (Step 6) -- always derived from a *final* translation (see
+    TranslationProvider.synthesize_speech in backend/translation/base.py).
+    `audio_base64` is a complete, independently-decodable WAV file (see
+    _pcm16_to_wav_bytes in backend/websocket/handlers.py), not a raw PCM
+    fragment, so the client can hand it straight to the browser's
+    decodeAudioData. A single phrase's speech may arrive as several of
+    these in a row -- one per speakable chunk (see
+    backend/translation/text_chunking.py) -- streamed as each chunk
+    finishes synthesizing rather than batched, so playback of the first
+    chunk can start before later ones are ready. The client is expected to
+    queue and play them back to back, never overlapping (see
+    frontend/src/audio/audioPlayback.js)."""
+
+    type: Literal["audio"] = "audio"
+    audio_base64: str
+    sample_rate: int
+    timestamp: str
+
+
 class ErrorMessage(BaseModel):
     type: Literal["error"] = "error"
     message: str
 
 
-ServerMessage = Union[StatusMessage, TranscriptMessage, TranslationMessage, ErrorMessage]
+ServerMessage = Union[
+    StatusMessage, TranscriptMessage, TranslationMessage, AudioMessage, ErrorMessage
+]
