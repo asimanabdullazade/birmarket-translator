@@ -1,13 +1,27 @@
+# pydantic/pydantic-settings were exact-pinned (==2.9.2 / ==2.5.2) before
+# this project used google-genai's Live API -- google-genai>=2.21.0 itself
+# requires pydantic>=2.12.5, so an exact ==2.9.2 pin makes pip's resolver
+# report a hard conflict (confirmed with `pip install --dry-run` against
+# this exact file: relaxing to the ranges below resolves cleanly to
+# pydantic 2.13.5 / pydantic-settings 2.15.0, with fastapi/websockets
+# unaffected). Range instead of another exact pin so a future google-genai
+# bump doesn't immediately re-break this the same way.
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
-pydantic==2.9.2
-pydantic-settings==2.5.2
+pydantic>=2.12.5,<3.0.0
+pydantic-settings>=2.6.0,<3.0.0
 numpy==1.26.4
 websockets==13.1
 python-dotenv==1.0.1
 
-# Gemini translation provider (backend/translation/gemini_provider.py).
-google-genai>=1.0.0
+# Gemini translation provider (backend/translation/gemini_provider.py),
+# and Gemini Live Translate (backend/websocket/live_handlers.py) -- the
+# latter needs `client.aio.live.connect` plus the `translation_config`/
+# `input_audio_transcription`/`output_audio_transcription` fields on
+# LiveConnectConfig, confirmed present as of 2.21.0 (bumped from the
+# gemini-only >=1.0.0 floor, which predates the Live API's translation
+# support and wasn't verified to have it).
+google-genai>=2.21.0
 
 # Local, free translation provider (backend/translation/local_provider.py):
 # speech-to-text via faster-whisper, translation via Meta's NLLB-200.
