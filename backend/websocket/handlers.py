@@ -56,6 +56,14 @@ Message flow
    complete speech-start-to-audio-heard latency breakdown -- see
    "Latency breakdown" below and "Measuring latency" in the README.
 
+One provider is a structural exception to all of the above: for
+`TRANSLATION_PROVIDER=gemini_live`, a validated `start` message is handed
+off whole to `run_live_session` (backend/websocket/live_handlers.py)
+instead of going through the segmenter/queue/consumer pipeline described
+here -- see that module's docstring for why (no utterance boundaries to
+segment in the first place) and "Live-mode dispatch" below for exactly
+where the fork happens.
+
 Errors at any step are reported as an `error` message rather than closing
 the socket, so the client can show it and try again without reconnecting.
 
@@ -96,6 +104,20 @@ pipeline -- see "Testing the microphone pipeline" in the README):
 - Duplicate detection: warns if a frame is byte-for-byte identical to the
   one immediately before it *and* contains speech (silence legitimately
   repeats byte-for-byte, so silent frames are exempt).
+
+Live-mode dispatch
+------------------
+`is_live_provider(settings.translation_provider)` (backend/translation/
+factory.py) is checked in the `StartMessage` branch below immediately
+after the language-support validation both modes share, and before this
+module builds a `SpeechSegmenter`/calls `get_provider()` -- so that shared
+prelude (accept, `status: connected`, receive+validate `start`) lives in
+exactly one place for every provider, and only forks into two paths after
+it succeeds. `run_live_session` owns the rest of that session's lifecycle
+entirely (including reading `stop`/`set_muted` off the same socket) and
+returns once it ends, at which point this module's outer loop resumes
+normally -- so a second `start` on the same socket still works, same as
+every other provider.
 
 And independent of that, VAD phrase boundaries are logged at INFO level
 (speech started / an utterance of N seconds was queued), and setting
@@ -164,7 +186,8 @@ from backend.models.schemas import (
     parse_client_message,
 )
 from backend.translation.base import EventKind, TranslationEvent, TranslationProvider
-from backend.translation.factory import get_provider
+from backend.translation.factory import get_provider, is_live_provider
+from backend.websocket.live_handlers import run_live_session
 from config.languages import is_supported
 from config.settings import Settings
 
@@ -512,6 +535,16 @@ async def handle_connection(websocket: WebSocket, settings: Settings) -> None:
                         continue
 
                     source_lang, target_lang = parsed.source_lang, parsed.target_lang
+
+                    if is_live_provider(settings.translation_provider):
+                        # See "Live-mode dispatch" above -- this owns the
+                        # whole session lifecycle itself (including its
+                        # own stop/set_muted handling) and only returns
+                        # once that's over, at which point the outer loop
+                        # below just resumes waiting for the next message.
+                        await run_live_session(websocket, settings, source_lang, target_lang, parsed.sample_rate)
+                        continue
+
                     segmenter = SpeechSegmenter(
                         sample_rate=parsed.sample_rate,
                         channels=settings.audio_channels,

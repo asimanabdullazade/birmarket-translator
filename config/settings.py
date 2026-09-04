@@ -36,7 +36,8 @@ class Settings(BaseSettings):
     # on your CPU. "mock" needs nothing but returns placeholder text, useful
     # for testing the plumbing without waiting on models or an API call. Set
     # to "openai", "azure", or "google" for one of the other paid vendor
-    # APIs, and supply the matching key(s) below.
+    # APIs, and supply the matching key(s) below. "gemini_live" is a
+    # different shape entirely -- see the next paragraph.
     translation_provider: str = "gemini"
 
     gemini_api_key: Optional[str] = None
@@ -48,6 +49,22 @@ class Settings(BaseSettings):
     # for the current model name and voice list and override here.
     gemini_tts_model: str = "gemini-2.5-flash-preview-tts"
     gemini_tts_voice: str = "Kore"
+
+    # "gemini_live" (TRANSLATION_PROVIDER=gemini_live): Gemini's *Live* API
+    # -- one persistent connection, continuous audio in, continuous
+    # translated audio out, no waiting for a complete utterance first --
+    # rather than the request/response Interactions API above. Reuses
+    # GEMINI_API_KEY; no separate credential. See "Using Gemini Live
+    # Translate" in the README and backend/websocket/live_handlers.py for
+    # the (substantial) architectural difference from every other provider
+    # here. gemini_live_finalize_silence_ms/gemini_live_max_phrase_seconds
+    # only matter as *fallbacks* -- live_handlers.py prefers a native
+    # turn/transcription-completion signal from the API when one arrives;
+    # these are the backstop for whenever that signal doesn't (see the
+    # module docstring for why both exist).
+    gemini_live_model: str = "gemini-3.5-live-translate-preview"
+    gemini_live_finalize_silence_ms: float = 700.0
+    gemini_live_max_phrase_seconds: float = 15.0
 
     openai_api_key: Optional[str] = None
     azure_speech_key: Optional[str] = None
