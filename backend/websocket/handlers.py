@@ -49,6 +49,12 @@ Message flow
    client's own playback volume/mute (see "Translation audio playback" in
    the README) -- this one is purely about not spending a TTS call on
    audio the client has already said it won't play.
+7. Client sends `audio_played` the instant it starts playing the first
+   synthesized audio chunk of a phrase (Step 7). Combined with the
+   timestamps this module already records for that phrase (VAD end,
+   transcript, translation, first TTS chunk ready), that's enough to log a
+   complete speech-start-to-audio-heard latency breakdown -- see
+   "Latency breakdown" below and "Measuring latency" in the README.
 
 Errors at any step are reported as an `error` message rather than closing
 the socket, so the client can show it and try again without reconnecting.
@@ -98,6 +104,34 @@ session's raw audio (raw.wav) and each individual detected *final* phrase
 (utterance_001.wav, utterance_002.wav, ...) to .wav files -- the latter is
 the direct way to check VAD is placing phrase boundaries correctly (not
 clipping the first word, not fragmenting a sentence on a short pause).
+
+Latency breakdown (Step 7)
+---------------------------
+`latency` (a dict, keyed by each phrase's `started_at` timestamp -- the
+same one shared by every message about that phrase) accumulates one
+extra timestamp per pipeline stage as that phrase moves through this
+module: `audio_captured_at` (VAD decided the utterance is complete,
+recorded in `enqueue_final`), `transcript_generated_at` /
+`translation_generated_at` (recorded right after `process_audio_chunk()`
+returns, in `consume()` -- or earlier, per-event, for a provider that can
+report its own sub-step timing; see TranslationEvent.generated_at in
+base.py), and `voice_ready_at` (the first synthesized audio chunk was
+ready, recorded in `_stream_tts`). The phrase's own `started_at`
+timestamp doubles as the "user starts speaking" point -- it's set the
+moment VAD detects speech beginning.
+
+That's every stage except the very last one, "audio reaches listener",
+which can only be known client-side (decoding + Web Audio scheduling all
+happen in the browser). The client reports it back explicitly via an
+`audio_played` message the instant it starts playing the first chunk of
+a phrase (see AudioPlayedMessage in schemas.py) -- at which point
+`_log_latency_breakdown` has every timestamp it needs and logs the full
+breakdown, in the same shape as the worked example in the Step 7 task:
+capture (mic + VAD's deliberate end-of-speech wait), speech recognition,
+translation, voice generation, and network+playback, plus a total. See
+"Measuring latency" in the README for how to read it and its one real
+caveat (frontend and backend clocks are only directly comparable because
+they're the same machine's clock in this project's dev setup).
 """
 
 from __future__ import annotations
@@ -119,6 +153,7 @@ from backend.audio.segmenter import SegmenterEventKind, SpeechSegmenter
 from backend.audio.vad import is_speech
 from backend.models.schemas import (
     AudioMessage,
+    AudioPlayedMessage,
     ErrorMessage,
     SetMutedMessage,
     StartMessage,
@@ -222,7 +257,9 @@ def _pcm16_to_wav_bytes(pcm16_bytes: bytes, sample_rate: int, channels: int = 1)
     return buf.getvalue()
 
 
-async def _stream_tts(websocket: WebSocket, provider: TranslationProvider, text: str, timestamp: str) -> None:
+async def _stream_tts(
+    websocket: WebSocket, provider: TranslationProvider, text: str, timestamp: str, latency: dict
+) -> None:
     """Synthesize `text` (a final translation) to speech and stream each
     ready chunk to the client immediately as an `audio` message (Step 6),
     rather than collecting the whole thing first -- see
@@ -230,11 +267,22 @@ async def _stream_tts(websocket: WebSocket, provider: TranslationProvider, text:
     streaming call. A synthesis failure is logged and simply means less
     audio gets played; it never propagates up and breaks the rest of the
     pipeline (transcription/translation already succeeded by the time
-    this runs)."""
+    this runs).
+
+    Step 7: the moment the *first* chunk is ready (before it's even sent)
+    is recorded into `latency[timestamp]["voice_ready_at"]` -- the end of
+    the "Voice generation" leg of the latency breakdown. Later chunks of
+    the same phrase don't get their own timestamp; only the first chunk's
+    readiness (and, client-side, the first chunk's playback) is what the
+    breakdown measures."""
     try:
+        first_chunk = True
         async for pcm_chunk, sample_rate in provider.synthesize_speech(text):
             if not pcm_chunk:
                 continue
+            if first_chunk:
+                latency.setdefault(timestamp, {})["voice_ready_at"] = _now_iso()
+                first_chunk = False
             payload = AudioMessage(
                 audio_base64=base64.b64encode(_pcm16_to_wav_bytes(pcm_chunk, sample_rate)).decode("ascii"),
                 sample_rate=sample_rate,
@@ -246,6 +294,61 @@ async def _stream_tts(websocket: WebSocket, provider: TranslationProvider, text:
         raise
     except Exception:
         logger.exception("Error while synthesizing/streaming translated speech")
+
+
+def _iso_to_epoch_ms(iso_timestamp: str) -> float:
+    return datetime.fromisoformat(iso_timestamp).timestamp() * 1000
+
+
+def _log_latency_breakdown(phrase_timestamp: str, entry: dict, played_at_ms: float) -> None:
+    """Step 7: log a start-to-finish latency breakdown for one phrase,
+    once the client's `audio_played` message supplies the one timestamp
+    that can't be known server-side. See "Latency breakdown" in this
+    module's docstring for where each of `entry`'s timestamps comes from,
+    and "Measuring latency" in the README for how to read the result.
+
+    Legs with a missing endpoint (e.g. a provider that never populated
+    `audio_captured_at` for some reason) are logged as "n/a" rather than
+    raising -- this is a diagnostic, not something that should ever take
+    down the session."""
+    try:
+        points_iso = {
+            "speech_start": phrase_timestamp,
+            "audio_captured_at": entry.get("audio_captured_at"),
+            "transcript_generated_at": entry.get("transcript_generated_at"),
+            "translation_generated_at": entry.get("translation_generated_at"),
+            "voice_ready_at": entry.get("voice_ready_at"),
+        }
+        points_ms = {key: (_iso_to_epoch_ms(value) if value else None) for key, value in points_iso.items()}
+        points_ms["audio_played_at"] = played_at_ms
+
+        order = [
+            "speech_start",
+            "audio_captured_at",
+            "transcript_generated_at",
+            "translation_generated_at",
+            "voice_ready_at",
+            "audio_played_at",
+        ]
+        labels = [
+            "Capture (mic + VAD end-silence wait)",
+            "Speech recognition",
+            "Translation",
+            "Voice generation (TTS)",
+            "Network + playback start",
+        ]
+
+        lines = [f"Latency breakdown for the phrase starting at {phrase_timestamp}:"]
+        for label, start_key, end_key in zip(labels, order[:-1], order[1:]):
+            start_ms, end_ms = points_ms[start_key], points_ms[end_key]
+            value = f"{end_ms - start_ms:6.0f} ms" if start_ms is not None and end_ms is not None else "   n/a"
+            lines.append(f"  {label:<38} {value}")
+        lines.append(f"  {'-' * 48}")
+        total = points_ms["audio_played_at"] - points_ms["speech_start"]
+        lines.append(f"  {'Total (speech start -> audio heard)':<38} {total:6.0f} ms")
+        logger.info("\n".join(lines))
+    except Exception:
+        logger.exception("Failed to compute/log the Step 7 latency breakdown")
 
 
 async def handle_connection(websocket: WebSocket, settings: Settings) -> None:
@@ -274,6 +377,14 @@ async def handle_connection(websocket: WebSocket, settings: Settings) -> None:
     # muted translation audio, rather than synthesizing speech nobody will
     # hear. Set via a `set_muted` message, independent of `start`/`stop`.
     translation_muted = False
+    # Step 7: per-phrase latency timestamps, keyed by that phrase's
+    # started_at -- see "Latency breakdown" in this module's docstring.
+    # Entries are removed once a matching `audio_played` message lets us
+    # log the full breakdown; an entry for a phrase that's muted, fails to
+    # synthesize, or otherwise never produces audio simply never gets
+    # cleaned up early, but that's a handful of small dicts at most for
+    # the life of one session -- not worth adding eviction logic for.
+    latency: dict = {}
 
     # Completed phrases (and interim updates) are handed off here
     # immediately; a background task drains them in order, so a slow
@@ -308,12 +419,24 @@ async def handle_connection(websocket: WebSocket, settings: Settings) -> None:
                 await _send_events(websocket, events, target_lang, source_lang, started_at)
                 last_partial_text = None
 
+                # Step 7: record when the transcript/translation for this
+                # phrase actually became available -- from the event
+                # itself if the provider reported it (local_provider.py),
+                # otherwise "now" (gemini/mock produce both atomically in
+                # one call, so both legitimately share the same instant).
+                now = _now_iso()
+                latency_entry = latency.setdefault(started_at, {})
+                transcript_event = next((e for e in events if e.kind == EventKind.TRANSCRIPT), None)
+                translation_event = next((e for e in events if e.kind == EventKind.TRANSLATION), None)
+                if transcript_event is not None:
+                    latency_entry["transcript_generated_at"] = transcript_event.generated_at or now
+                if translation_event is not None:
+                    latency_entry["translation_generated_at"] = translation_event.generated_at or now
+
                 if not translation_muted:
-                    translation_text = next(
-                        (event.text for event in events if event.kind == EventKind.TRANSLATION), ""
-                    )
+                    translation_text = translation_event.text if translation_event is not None else ""
                     if translation_text:
-                        await _stream_tts(websocket, provider, translation_text, started_at)
+                        await _stream_tts(websocket, provider, translation_text, started_at, latency)
 
                 if queue.empty():
                     await _safe_send(websocket, StatusMessage(status="listening").model_dump_json())
@@ -357,6 +480,10 @@ async def handle_connection(websocket: WebSocket, settings: Settings) -> None:
         logger.info("VAD: speech ended -- utterance #%d, %.2fs queued for translation", utterance_index, duration_s)
         if debug_session_dir is not None:
             _dump_utterance(debug_session_dir, sample_rate, settings.audio_channels, utterance_index, audio)
+        # Step 7: this is "audio reaches backend" in the sense that matters
+        # for latency -- the earliest point at which this phrase's *complete*
+        # audio is actually available to hand to a provider.
+        latency.setdefault(phrase_started_at, {})["audio_captured_at"] = _now_iso()
         queue.put_nowait(("final", audio, phrase_started_at))
 
     def enqueue_partial(audio: bytes) -> None:
@@ -427,6 +554,11 @@ async def handle_connection(websocket: WebSocket, settings: Settings) -> None:
                 elif isinstance(parsed, SetMutedMessage):
                     translation_muted = parsed.muted
                     logger.info("Translation audio %s", "muted" if translation_muted else "unmuted")
+
+                elif isinstance(parsed, AudioPlayedMessage):
+                    entry = latency.pop(parsed.timestamp, None)
+                    if entry is not None:
+                        _log_latency_breakdown(parsed.timestamp, entry, parsed.played_at_ms)
 
             elif "bytes" in message and message["bytes"] is not None:
                 if not session_active or segmenter is None or provider is None:

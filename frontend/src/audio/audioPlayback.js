@@ -59,12 +59,21 @@ export class TranslationAudioPlayer {
     }
   }
 
-  /** Decode and schedule one base64-encoded WAV segment for gapless playback. */
+  /**
+   * Decode and schedule one base64-encoded WAV segment for gapless
+   * playback. Resolves with a wall-clock (`Date.now()`-based) estimate of
+   * the moment this segment actually becomes audible -- used for Step 7's
+   * latency breakdown (see the caller in hooks/useWebSocket.js, which
+   * reports the *first* chunk's value back to the server as an
+   * `audio_played` message). Resolves `undefined` instead if this segment
+   * failed to decode/play, so callers know not to report a bogus number.
+   */
   enqueue(base64Wav) {
     this._chain = this._chain
       .then(() => this._enqueueOne(base64Wav))
       .catch((err) => {
         console.warn("[TranslationAudioPlayer] Failed to play a synthesized audio segment", err);
+        return undefined;
       });
     return this._chain;
   }
@@ -96,6 +105,14 @@ export class TranslationAudioPlayer {
     const startAt = Math.max(this.nextStartTime, audioContext.currentTime);
     source.start(startAt);
     this.nextStartTime = startAt + audioBuffer.duration;
+
+    // Step 7: AudioContext's clock has no fixed relationship to
+    // Date.now() by itself, but the *delay* between "now" and `startAt`
+    // is in the same units (seconds) regardless of anchor -- so
+    // Date.now() plus that delay is a fair wall-clock estimate of when
+    // this segment actually starts being audible, including any queueing
+    // wait behind a still-playing earlier segment.
+    return Date.now() + Math.max(0, (startAt - audioContext.currentTime) * 1000);
   }
 
   /** Stop everything scheduled/playing and reset the queue (e.g. on Stop). */
