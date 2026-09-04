@@ -53,8 +53,29 @@ class SetMutedMessage(BaseModel):
     muted: bool
 
 
+class AudioPlayedMessage(BaseModel):
+    """Step 7 (latency measurement): sent by the client the instant it
+    actually begins playing the *first* synthesized audio chunk for a
+    given phrase (see frontend/src/hooks/useWebSocket.js and
+    TranslationAudioPlayer._enqueueOne in frontend/src/audio/
+    audioPlayback.js). This is the one point in the whole speech-start-to-
+    audio-heard timeline that can only be known client-side -- everything
+    else (VAD detection, transcript/translation/TTS completion) already
+    happens on the server. `played_at_ms` is the client's own epoch-
+    millisecond wall clock (JS `Date.now()`), adjusted for any Web Audio
+    scheduling delay still ahead of it. `backend/websocket/handlers.py`
+    compares this directly against its own UTC timestamps to log a full
+    latency breakdown -- see "Measuring latency" in the README for why
+    that's valid only because the frontend and backend run on the same
+    machine's clock in this project's current dev setup."""
+
+    type: Literal["audio_played"] = "audio_played"
+    timestamp: str
+    played_at_ms: float
+
+
 ClientMessage = Annotated[
-    Union[StartMessage, StopMessage, SetMutedMessage], Field(discriminator="type")
+    Union[StartMessage, StopMessage, SetMutedMessage, AudioPlayedMessage], Field(discriminator="type")
 ]
 
 _client_message_adapter: TypeAdapter[ClientMessage] = TypeAdapter(ClientMessage)

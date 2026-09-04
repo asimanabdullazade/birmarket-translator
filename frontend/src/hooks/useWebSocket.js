@@ -33,6 +33,20 @@ import { TranslationAudioPlayer } from "../audio/audioPlayback.js";
  * `muted` control that player's GainNode; `muted` is also sent to the
  * server as a `set_muted` message so it can skip the TTS call entirely
  * rather than synthesizing audio nobody will hear.
+ *
+ * Latency measurement (Step 7)
+ * -----------------------------
+ * The server already knows when each phrase's speech was detected, when
+ * its audio finished capturing, and when transcription/translation/TTS
+ * each completed -- everything except the one moment that only exists in
+ * the browser: when the translated audio actually starts being audible.
+ * The *first* `audio` message for each phrase (tracked via
+ * `reportedPhrasesRef`, keyed by the phrase's `timestamp`) gets that
+ * moment from `TranslationAudioPlayer.enqueue()`'s resolved value and
+ * reports it back as an `audio_played` message, so
+ * backend/websocket/handlers.py can log a complete start-to-finish
+ * latency breakdown for that phrase. See "Measuring latency" in the
+ * README.
  */
 export function useTranslationSession() {
   const [status, setStatus] = useState("idle"); // idle | connected | listening | translating | error
@@ -51,6 +65,10 @@ export function useTranslationSession() {
   // Mirrors `muted` for code that can't wait for a re-render (the `start`
   // callback's `onopen` closure, captured once per call) -- see `start` below.
   const mutedRef = useRef(false);
+  // Step 7: phrase timestamps we've already sent an `audio_played` report
+  // for, so only the *first* audio chunk of a phrase gets reported (later
+  // chunks of a multi-chunk phrase don't need their own latency number).
+  const reportedPhrasesRef = useRef(new Set());
 
   // Create-or-update the history entry for a given phrase timestamp.
   const upsertEntry = useCallback((timestamp, patch) => {
@@ -105,6 +123,7 @@ export function useTranslationSession() {
       setErrorMessage(null);
       setHistory([]);
       setLivePartial(null);
+      reportedPhrasesRef.current = new Set();
 
       const socket = new WebSocket(BACKEND_WS_URL);
       socketRef.current = socket;
@@ -156,13 +175,27 @@ export function useTranslationSession() {
             // (existing or not-yet-created) history entry.
             upsertEntry(message.timestamp, { translationText: message.text });
             break;
-          case "audio":
+          case "audio": {
             // One synthesized-speech chunk for a translated phrase (Step
             // 6) -- queue it for gapless playback. Not correlated with
             // `history` by timestamp for display purposes; the player
             // handles ordering/overlap on its own.
-            playerRef.current.enqueue(message.audio_base64);
+            const isFirstChunkForPhrase = !reportedPhrasesRef.current.has(message.timestamp);
+            const playedPromise = playerRef.current.enqueue(message.audio_base64);
+            if (isFirstChunkForPhrase) {
+              // Step 7: only the first chunk's actual playback moment is
+              // worth reporting -- see the module docstring above.
+              reportedPhrasesRef.current.add(message.timestamp);
+              playedPromise.then((playedAtMs) => {
+                if (playedAtMs != null && socketRef.current?.readyState === WebSocket.OPEN) {
+                  socketRef.current.send(
+                    JSON.stringify({ type: "audio_played", timestamp: message.timestamp, played_at_ms: playedAtMs })
+                  );
+                }
+              });
+            }
             break;
+          }
           case "error":
             setErrorMessage(message.message);
             break;

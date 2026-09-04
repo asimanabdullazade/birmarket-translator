@@ -32,6 +32,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+from datetime import datetime, timezone
 from typing import AsyncIterator, Optional
 
 import numpy as np
@@ -61,6 +62,10 @@ _load_lock = threading.Lock()
 _whisper_model = None
 _nllb_translator = None
 _nllb_tokenizer = None
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _get_whisper_model(model_size: str, compute_type: str):
@@ -143,14 +148,26 @@ class LocalWhisperNLLBProvider(TranslationProvider):
 
         loop = asyncio.get_event_loop()
         transcript = (await loop.run_in_executor(None, self._transcribe, audio)).strip()
+        # Step 7: captured right after the (real) transcribe call returns,
+        # before translation even starts -- unlike gemini_provider.py/
+        # mock_provider.py, this provider's transcribe and translate steps
+        # are genuinely two separate, sequential calls, so it's worth
+        # reporting their true individual completion times rather than
+        # collapsing them into one (see TranslationEvent.generated_at).
+        transcript_generated_at = _now_iso()
         if not transcript:
             return []
 
         translation = (await loop.run_in_executor(None, self._translate, transcript)).strip()
+        translation_generated_at = _now_iso()
 
         return [
-            TranslationEvent(kind=EventKind.TRANSCRIPT, text=transcript, is_final=True),
-            TranslationEvent(kind=EventKind.TRANSLATION, text=translation, is_final=True),
+            TranslationEvent(
+                kind=EventKind.TRANSCRIPT, text=transcript, is_final=True, generated_at=transcript_generated_at
+            ),
+            TranslationEvent(
+                kind=EventKind.TRANSLATION, text=translation, is_final=True, generated_at=translation_generated_at
+            ),
         ]
 
     async def transcribe_partial(self, pcm16_bytes: bytes) -> Optional[str]:

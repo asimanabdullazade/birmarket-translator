@@ -51,9 +51,12 @@ def get_provider(settings: Settings) -> TranslationProvider:
         from backend.translation.azure_provider import AzureSpeechTranslationProvider
 
         return AzureSpeechTranslationProvider(
-            speech_key=settings.azure_speech_key, region=settings.azure_speech_region
+            speech_key=settings.azure_speech_key,
+            region=settings.azure_speech_region,
+            sample_rate=settings.audio_sample_rate,
         )
-
+        
+    
     if provider_name == "google":
         from backend.translation.google_provider import GoogleCloudTranslationProvider
 

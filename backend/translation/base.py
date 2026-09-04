@@ -37,6 +37,17 @@ class TranslationEvent:
     # selected in the UI. Purely informational; never used to override the
     # user's selection.
     detected_language: Optional[str] = None
+    # Step 7 (latency measurement): ISO-8601 UTC timestamp of when THIS
+    # specific event's result actually became available, for providers
+    # that can distinguish sub-steps -- see local_provider.py, whose
+    # transcribe and translate calls are genuinely sequential. Leave this
+    # unset (None) if your provider produces transcript+translation
+    # atomically in one call (gemini_provider.py's single Interactions API
+    # round trip; mock_provider.py) -- `websocket/handlers.py` then falls
+    # back to the instant process_audio_chunk() returned for both events,
+    # which correctly reports a ~zero "Translation" leg for an atomic
+    # provider instead of fabricating a non-zero one that isn't real.
+    generated_at: Optional[str] = None
 
 
 class TranslationProvider(ABC):
