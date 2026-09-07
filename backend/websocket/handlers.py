@@ -127,6 +127,47 @@ session's raw audio (raw.wav) and each individual detected *final* phrase
 the direct way to check VAD is placing phrase boundaries correctly (not
 clipping the first word, not fragmenting a sentence on a short pause).
 
+Streaming translation (Phase 8)
+--------------------------------
+For gemini/mock (the only providers that implement
+TranslationProvider.translate_partial -- local/azure are unaffected, see
+"Using streaming translation" in the README), a *second* thing happens
+inside the `"partial"` branch below, independent of the transcript-only
+logic Step 4 already does there: each new partial transcript is compared
+word-by-word against the *previous* one (see backend/translation/
+stability.py's "local agreement" helpers) to find a stable, unlikely-to-
+change prefix. Once that prefix has grown enough, the newly-stabilized
+increment (never anything already committed) is translated and spoken
+immediately -- via the same `_stream_tts` used for finals -- rather than
+waiting for the whole phrase to end. This state lives in
+`phrase_streaming_state`, keyed by each phrase's `started_at` (the same
+pattern `latency` already uses) rather than shared nonlocals reset on
+SPEECH_START, specifically because `consume()` can lag behind the main
+receive loop (see "Why a queue" above) -- a new phrase's SPEECH_START can
+arrive before the previous phrase's queued items finish, and resetting
+shared state on SPEECH_START would corrupt that still-in-flight phrase's
+commit state.
+
+At finalization (the `"final"` branch), the authoritative
+process_audio_chunk() transcript/translation are computed exactly as
+before Phase 8 -- this alone is what "corrects" the transcript shown to
+the user, since that full re-transcription naturally fixes any earlier
+partial mistake, no extra code needed. For *audio*, only the part of the
+final translation not already covered by what was incrementally committed
+gets synthesized (reconcile_final_tts_text in stability.py) -- so a phrase
+that streamed cleanly never re-speaks its own already-played audio. See
+that function's docstring for why this reconciliation is deliberately an
+all-or-nothing decision rather than a fine-grained diff.
+
+Bugfix (found during manual testing): the authoritative final translation
+is what's supposed to correct anything shown so far for a phrase -- but if
+it comes back completely EMPTY (a short trailing bit of audio VAD
+segmented as its own phrase, which the authoritative pass correctly
+recognizes as no real speech) while something WAS incrementally committed
+and already displayed, nothing else ever corrected it, leaving a
+translation with no matching source text stuck on screen. See the explicit
+empty-final-translation handling in the "final" branch below.
+
 Latency breakdown (Step 7)
 ---------------------------
 `latency` (a dict, keyed by each phrase's `started_at` timestamp -- the
@@ -187,6 +228,12 @@ from backend.models.schemas import (
 )
 from backend.translation.base import EventKind, TranslationEvent, TranslationProvider
 from backend.translation.factory import get_provider, is_live_provider
+from backend.translation.stability import (
+    longest_common_prefix_len,
+    reconcile_final_tts_text,
+    stable_prefix_len,
+    tokenize,
+)
 from backend.websocket.live_handlers import run_live_session
 from config.languages import is_supported
 from config.settings import Settings
@@ -297,15 +344,23 @@ async def _stream_tts(
     the "Voice generation" leg of the latency breakdown. Later chunks of
     the same phrase don't get their own timestamp; only the first chunk's
     readiness (and, client-side, the first chunk's playback) is what the
-    breakdown measures."""
+    breakdown measures.
+
+    Phase 8: this can now be called more than once per phrase (once per
+    incremental commit, plus once for the final remainder -- see
+    "Streaming translation" above), so "first chunk" is checked against
+    the shared `latency` dict rather than a call-local flag -- otherwise a
+    later call would overwrite voice_ready_at with a later time instead of
+    leaving the true first chunk's timestamp in place. No lock needed:
+    consume() is a single task, so there's no concurrent writer for the
+    same phrase."""
     try:
-        first_chunk = True
         async for pcm_chunk, sample_rate in provider.synthesize_speech(text):
             if not pcm_chunk:
                 continue
-            if first_chunk:
-                latency.setdefault(timestamp, {})["voice_ready_at"] = _now_iso()
-                first_chunk = False
+            entry = latency.setdefault(timestamp, {})
+            if "voice_ready_at" not in entry:
+                entry["voice_ready_at"] = _now_iso()
             payload = AudioMessage(
                 audio_base64=base64.b64encode(_pcm16_to_wav_bytes(pcm_chunk, sample_rate)).decode("ascii"),
                 sample_rate=sample_rate,
@@ -408,6 +463,16 @@ async def handle_connection(websocket: WebSocket, settings: Settings) -> None:
     # cleaned up early, but that's a handful of small dicts at most for
     # the life of one session -- not worth adding eviction logic for.
     latency: dict = {}
+    # Phase 8 (streaming translation): per-in-flight-phrase incremental-
+    # commit state, keyed by that phrase's started_at -- same rationale as
+    # `latency` above (consume() can lag behind the main receive loop, so
+    # keying by started_at rather than resetting shared nonlocals on
+    # SPEECH_START keeps each phrase's state independent of processing
+    # order/backlog). Each entry: {"last_partial_words": [...],
+    # "committed_words": [...], "committed_translation_text": "...",
+    # "first_commit_at": Optional[str]}. Popped once that phrase's "final"
+    # item finishes processing -- see "Streaming translation" above.
+    phrase_streaming_state: dict = {}
 
     # Completed phrases (and interim updates) are handed off here
     # immediately; a background task drains them in order, so a slow
@@ -433,6 +498,67 @@ async def handle_connection(websocket: WebSocket, settings: Settings) -> None:
                             websocket,
                             TranscriptMessage(text=text, is_final=False, timestamp=started_at).model_dump_json(),
                         )
+
+                    # Phase 8: react to the growing transcript, independent
+                    # of whether it changed since the last one *sent* above
+                    # -- see "Streaming translation" in this module's
+                    # docstring. No-ops for any provider that doesn't
+                    # override translate_partial (local/azure), since
+                    # translate_partial then just returns None below.
+                    if settings.streaming_incremental_translation and text:
+                        state = phrase_streaming_state.setdefault(
+                            started_at,
+                            {
+                                "last_partial_words": [],
+                                "committed_words": [],
+                                "committed_translation_text": "",
+                                "first_commit_at": None,
+                            },
+                        )
+                        words = tokenize(text)
+                        lcp_len = longest_common_prefix_len(state["last_partial_words"], words)
+                        state["last_partial_words"] = words
+                        new_stable_len = stable_prefix_len(
+                            len(state["committed_words"]),
+                            lcp_len,
+                            settings.streaming_stability_holdback_words,
+                            settings.streaming_min_commit_words,
+                        )
+                        if new_stable_len > len(state["committed_words"]):
+                            new_stable_text = " ".join(words[len(state["committed_words"]) : new_stable_len])
+                            translation_delta = await provider.translate_partial(
+                                new_stable_text, state["committed_translation_text"]
+                            )
+                            if translation_delta:
+                                state["committed_words"] = words[:new_stable_len]
+                                state["committed_translation_text"] = (
+                                    f"{state['committed_translation_text']} {translation_delta}".strip()
+                                )
+                                if state["first_commit_at"] is None:
+                                    state["first_commit_at"] = _now_iso()
+                                    elapsed_ms = _iso_to_epoch_ms(state["first_commit_at"]) - _iso_to_epoch_ms(
+                                        started_at
+                                    )
+                                    logger.info(
+                                        "Streaming translation: first incremental commit at %.0fms into the "
+                                        "phrase -- new stable text %r",
+                                        elapsed_ms,
+                                        new_stable_text,
+                                    )
+                                await _safe_send(
+                                    websocket,
+                                    TranslationMessage(
+                                        text=state["committed_translation_text"],
+                                        is_final=False,
+                                        source_lang=source_lang,
+                                        target_lang=target_lang,
+                                        timestamp=started_at,
+                                    ).model_dump_json(),
+                                )
+                                if not translation_muted:
+                                    # Only the new delta -- never re-synthesize
+                                    # anything already committed/spoken.
+                                    await _stream_tts(websocket, provider, translation_delta, started_at, latency)
                     continue
 
                 # kind == "final"
@@ -441,6 +567,16 @@ async def handle_connection(websocket: WebSocket, settings: Settings) -> None:
                 events = await provider.process_audio_chunk(audio)
                 await _send_events(websocket, events, target_lang, source_lang, started_at)
                 last_partial_text = None
+
+                # Phase 8: whatever got incrementally committed for this
+                # phrase (if anything -- empty for providers that don't
+                # implement translate_partial, or a phrase too short for
+                # any commit to clear the bar) is reconciled against the
+                # authoritative final translation below, once it's known.
+                streaming_state = phrase_streaming_state.pop(started_at, None)
+                committed_translation_text = (
+                    streaming_state["committed_translation_text"] if streaming_state else ""
+                )
 
                 # Step 7: record when the transcript/translation for this
                 # phrase actually became available -- from the event
@@ -456,10 +592,63 @@ async def handle_connection(websocket: WebSocket, settings: Settings) -> None:
                 if translation_event is not None:
                     latency_entry["translation_generated_at"] = translation_event.generated_at or now
 
+                translation_text = translation_event.text if translation_event is not None else ""
+
+                # Phase 8 bugfix: the authoritative final translation is
+                # supposed to correct anything shown so far for this phrase
+                # ("Correct final transcript internally without replaying
+                # everything" above) -- but if the final translation comes
+                # back EMPTY while something WAS incrementally committed
+                # (e.g. a short trailing bit of audio VAD segmented as its
+                # own phrase, which the authoritative pass correctly
+                # recognizes as no real speech -- process_audio_chunk
+                # returns [] whenever its transcript is empty, so
+                # translation_event is None and translation_text is "" too
+                # here), nothing else ever corrects the display: _send_events
+                # above sent nothing (there were no events), so the client is
+                # left showing a translation with no matching source text
+                # forever. Explicitly clear it with an empty final
+                # TranslationMessage whenever this happens, regardless of
+                # mute -- this is about text correctness, not the
+                # audio-skipping mute toggle below.
+                if not translation_text and committed_translation_text:
+                    logger.info(
+                        "Streaming translation: finalization diverged -- the final translation "
+                        "was empty, clearing the incrementally-committed text shown for this phrase"
+                    )
+                    await _safe_send(
+                        websocket,
+                        TranslationMessage(
+                            text="",
+                            is_final=True,
+                            source_lang=source_lang,
+                            target_lang=target_lang,
+                            timestamp=started_at,
+                        ).model_dump_json(),
+                    )
+
                 if not translation_muted:
-                    translation_text = translation_event.text if translation_event is not None else ""
                     if translation_text:
-                        await _stream_tts(websocket, provider, translation_text, started_at, latency)
+                        # Phase 8: speak only what wasn't already spoken
+                        # incrementally -- see reconcile_final_tts_text in
+                        # stability.py. For any phrase with nothing
+                        # committed (committed_translation_text == ""),
+                        # this returns translation_text unchanged --
+                        # byte-identical to pre-Phase-8 behavior.
+                        remainder = reconcile_final_tts_text(
+                            committed_translation_text,
+                            translation_text,
+                            settings.streaming_final_reconcile_min_coverage,
+                        )
+                        if committed_translation_text:
+                            logger.info(
+                                "Streaming translation: finalization %s",
+                                "spoke only the new remainder"
+                                if remainder != translation_text
+                                else "diverged from the committed prefix -- spoke the whole final translation",
+                            )
+                        if remainder:
+                            await _stream_tts(websocket, provider, remainder, started_at, latency)
 
                 if queue.empty():
                     await _safe_send(websocket, StatusMessage(status="listening").model_dump_json())

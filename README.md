@@ -103,6 +103,7 @@ microphone permission when prompted, pick your languages/devices, and hit
 
 ## Real translation, for free
 
+
 `TRANSLATION_PROVIDER=local` (the default) runs two open-source models on
 your own CPU, no account or key required:
 
