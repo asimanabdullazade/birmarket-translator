@@ -171,8 +171,14 @@ export function useTranslationSession() {
             }
             break;
           case "translation":
-            // Translations are always final -- attach to the matching
-            // (existing or not-yet-created) history entry.
+            // Attach to the matching (existing or not-yet-created) history
+            // entry. `message.text` is always the FULL translation
+            // accumulated so far, whether this is the final version
+            // (is_final: true) or a growing incremental one sent while the
+            // phrase is still being spoken (Phase 8's streaming
+            // translation, is_final: false) -- either way a plain
+            // overwrite is correct and needs no extra handling here, the
+            // same way a growing partial transcript already works above.
             upsertEntry(message.timestamp, { translationText: message.text });
             break;
           case "audio": {

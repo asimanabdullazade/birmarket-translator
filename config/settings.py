@@ -101,6 +101,35 @@ class Settings(BaseSettings):
     # Lower = more responsive partial updates but more provider calls.
     vad_partial_interval_ms: float = 700.0
 
+    # --- Streaming translation (Phase 8) ---
+    # Instead of waiting for a whole utterance, translate/speak the STABLE
+    # part of a growing partial transcript as soon as it stops changing --
+    # see backend/translation/stability.py and "Using streaming
+    # translation" in the README. Only gemini/mock implement
+    # TranslationProvider.translate_partial (local/azure keep today's
+    # wait-for-final behavior regardless of this setting -- see the
+    # README section above for why). Master toggle, so today's baseline
+    # behavior is always one env var away for comparison/debugging.
+    streaming_incremental_translation: bool = True
+    # A word only "graduates" to committed once it's agreed on by two
+    # consecutive partial transcripts, then this many of ITS trailing
+    # words are additionally held back each round, as a safety margin
+    # against the next partial revising something that only looked stable
+    # by chance (transcribe_partial re-transcribes from scratch each round
+    # -- it's not a monotonic streaming decoder). Tune from your own logs
+    # (see the README) the same way VAD_END_SILENCE_MS was tuned.
+    streaming_stability_holdback_words: int = 2
+    # Minimum newly-stabilized word count worth bothering to translate+speak
+    # as an increment -- avoids chattering the API for single-word commits.
+    streaming_min_commit_words: int = 3
+    # At finalization, only trust (and skip re-speaking) the incrementally
+    # committed translation if it agrees with at least this fraction of
+    # itself against the authoritative final translation -- otherwise the
+    # whole final translation is spoken instead, exactly like pre-Phase-8
+    # behavior. See reconcile_final_tts_text in stability.py for why this
+    # is deliberately a binary fallback, not a fine-grained diff.
+    streaming_final_reconcile_min_coverage: float = 0.9
+
     # --- Logging ---
     log_level: str = "INFO"
 

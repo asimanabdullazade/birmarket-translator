@@ -119,8 +119,16 @@ class TranscriptMessage(BaseModel):
 
 
 class TranslationMessage(BaseModel):
-    """The translated text corresponding to a transcript segment. Always
-    final -- only completed phrases are translated (see base.py)."""
+    """The translated text corresponding to a transcript segment.
+
+    is_final=True is the authoritative translation of a completed phrase
+    (as before Phase 8). is_final=False is a *growing* incremental
+    translation sent while the phrase is still being spoken (Phase 8's
+    streaming translation, gemini/mock providers only -- see "Streaming
+    translation" in backend/websocket/handlers.py's docstring) -- `text`
+    is always the FULL accumulated translation committed so far, not just
+    the newest fragment, so a client can render it the same way it already
+    renders a growing partial transcript (overwrite in place)."""
 
     type: Literal["translation"] = "translation"
     text: str

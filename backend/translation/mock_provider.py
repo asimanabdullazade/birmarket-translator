@@ -45,12 +45,14 @@ class MockTranslationProvider(TranslationProvider):
         self._target_lang = "az"
         self._chunk_count = 0
         self._partial_count = 0
+        self._partial_translation_count = 0
 
     async def start_session(self, source_lang: str, target_lang: str) -> None:
         self._source_lang = source_lang
         self._target_lang = target_lang
         self._chunk_count = 0
         self._partial_count = 0
+        self._partial_translation_count = 0
 
     async def transcribe_partial(self, pcm16_bytes: bytes) -> Optional[str]:
         # Deliberately supported here (unlike most providers, where it's
@@ -58,6 +60,17 @@ class MockTranslationProvider(TranslationProvider):
         # zero external dependencies -- see "Testing STT" in the README.
         self._partial_count += 1
         return f"[mock partial #{self._partial_count}] ({self._source_lang})"
+
+    async def translate_partial(self, new_stable_text: str, already_committed_translation: str) -> Optional[str]:
+        # Deliberately supported here too (Phase 8), same reasoning as
+        # transcribe_partial above -- so the whole incremental-commit
+        # pipeline is exercisable with zero external dependencies. Echoes
+        # the new fragment back with a counter so a test/manual run can
+        # visibly confirm this is only ever called with genuinely NEW text,
+        # never a re-send of already_committed_translation -- see "Using
+        # streaming translation" in the README.
+        self._partial_translation_count += 1
+        return f"[mock translation Δ{self._partial_translation_count}] ({self._target_lang}): {new_stable_text}"
 
     async def process_audio_chunk(self, pcm16_bytes: bytes) -> list[TranslationEvent]:
         self._chunk_count += 1

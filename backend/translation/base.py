@@ -82,6 +82,33 @@ class TranslationProvider(ABC):
         """
         return None
 
+    async def translate_partial(self, new_stable_text: str, already_committed_translation: str) -> Optional[str]:
+        """
+        Phase 8 (streaming translation): translate a newly-*stabilized*
+        fragment of source text -- one `websocket/handlers.py` has decided,
+        via a word-level "local agreement" policy over consecutive
+        transcribe_partial() results (see backend/translation/stability.py),
+        is unlikely to change -- as a coherent CONTINUATION of whatever's
+        already been committed/translated/spoken for this same phrase.
+
+        `already_committed_translation` is the full translation text
+        already committed so far (may be empty, for the first commit of a
+        phrase); `new_stable_text` is only the newly-stabilized source-text
+        increment, never audio and never the whole phrase. Return ONLY the
+        new continuation -- never a retranslation of
+        already_committed_translation -- so callers can safely append your
+        result and never re-synthesize/re-speak text that's already been
+        spoken (see "avoid repeating audio" in the README's "Using
+        streaming translation" section).
+
+        Default: unsupported (None) -- providers that don't override this
+        simply never produce incremental commits, and every phrase for them
+        behaves exactly as it did before Phase 8 (wait for the full
+        utterance). This must stay fast/cheap-ish for the same reason
+        transcribe_partial does: it can be called several times per phrase.
+        """
+        return None
+
     async def synthesize_speech(self, text: str) -> AsyncIterator[tuple[bytes, int]]:
         """
         Convert already-*translated* text to speech (Step 6), yielding

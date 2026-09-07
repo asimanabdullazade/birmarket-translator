@@ -16,6 +16,13 @@ preserve numbers/dates/names/company names verbatim -- see
 _transcribe_and_translate's prompt below and "Translation quality" in the
 README.
 
+Phase 8 (streaming translation) adds translate_partial: a third, cheaper
+prompt (text-only -- no audio) that translates just a newly-stabilized
+fragment of an in-progress transcript as a continuation of whatever's
+already been committed for that phrase, rather than waiting for the whole
+sentence -- see _translate_continuation below and "Using streaming
+translation" in the README.
+
 Step 6 adds speech synthesis of the translated text (synthesize_speech),
 via a *different* API surface than everything above -- Gemini's native
 text-to-speech models go through `client.models.generate_content` with
@@ -76,6 +83,10 @@ class _TranscriptionResult(BaseModel):
 
 class _PartialTranscriptionResult(BaseModel):
     transcript: str
+
+
+class _PartialTranslationResult(BaseModel):
+    translation: str
 
 
 class GeminiTranslationProvider(TranslationProvider):
@@ -150,6 +161,16 @@ class GeminiTranslationProvider(TranslationProvider):
         transcript = result.transcript.strip()
         return transcript or None
 
+    async def translate_partial(self, new_stable_text: str, already_committed_translation: str) -> Optional[str]:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None, self._translate_continuation, new_stable_text, already_committed_translation
+        )
+        if result is None:
+            return None
+        translation = result.translation.strip()
+        return translation or None
+
     async def synthesize_speech(self, text: str) -> AsyncIterator[tuple[bytes, int]]:
         loop = asyncio.get_event_loop()
         for chunk in split_for_speech(text):
@@ -162,24 +183,33 @@ class GeminiTranslationProvider(TranslationProvider):
 
     # --- blocking helpers: always called via run_in_executor ---
 
-    def _call_gemini(self, pcm16_bytes: bytes, prompt: str, schema_model: Type[_ResultT]) -> Optional[_ResultT]:
+    def _call_gemini(
+        self, prompt: str, schema_model: Type[_ResultT], pcm16_bytes: Optional[bytes] = None
+    ) -> Optional[_ResultT]:
+        """`pcm16_bytes=None` builds a text-only request (Phase 8's
+        translate_partial: the input is already-transcribed text, not
+        audio, so there's nothing to attach -- a cheaper, faster round trip
+        than every other call here, which directly helps the "start
+        translating before the sentence ends" goal)."""
+        content = [self._TextContent(type="text", text=prompt)]
+        if pcm16_bytes is not None:
+            content.append(
+                self._AudioContent(
+                    type="audio",
+                    data=base64.b64encode(self._pcm16_to_wav(pcm16_bytes)).decode("ascii"),
+                    mime_type="audio/wav",
+                    # NOTE: do NOT also pass sample_rate/channels here -- the
+                    # API rejects that combination ("Rate and channels are
+                    # only supported for TYPE_L16 audio"). A WAV container
+                    # already encodes its own sample rate and channel count
+                    # in its header, so those fields would be redundant even
+                    # if they were allowed.
+                )
+            )
         try:
             interaction = self._client.interactions.create(
                 model=self._model,
-                input=[
-                    self._TextContent(type="text", text=prompt),
-                    self._AudioContent(
-                        type="audio",
-                        data=base64.b64encode(self._pcm16_to_wav(pcm16_bytes)).decode("ascii"),
-                        mime_type="audio/wav",
-                        # NOTE: do NOT also pass sample_rate/channels here -- the
-                        # API rejects that combination ("Rate and channels are
-                        # only supported for TYPE_L16 audio"). A WAV container
-                        # already encodes its own sample rate and channel count
-                        # in its header, so those fields would be redundant even
-                        # if they were allowed.
-                    ),
-                ],
+                input=content,
                 response_format={
                     "type": "text",
                     "mime_type": "application/json",
@@ -231,7 +261,7 @@ class GeminiTranslationProvider(TranslationProvider):
             "tell. If the audio has no discernible speech (silence, noise, just "
             "breathing), return an empty string for both transcript and translation."
         )
-        return self._call_gemini(pcm16_bytes, prompt, _TranscriptionResult)
+        return self._call_gemini(prompt, _TranscriptionResult, pcm16_bytes=pcm16_bytes)
 
     def _transcribe_only(self, pcm16_bytes: bytes) -> Optional[_PartialTranscriptionResult]:
         source_name = _LANGUAGE_NAMES.get(self._source_lang, self._source_lang)
@@ -248,7 +278,53 @@ class GeminiTranslationProvider(TranslationProvider):
             "sentence, that's expected. If there's no discernible speech yet, return "
             "an empty string."
         )
-        return self._call_gemini(pcm16_bytes, prompt, _PartialTranscriptionResult)
+        return self._call_gemini(prompt, _PartialTranscriptionResult, pcm16_bytes=pcm16_bytes)
+
+    def _translate_continuation(
+        self, new_stable_text: str, already_committed_translation: str
+    ) -> Optional[_PartialTranslationResult]:
+        """Phase 8: translate a newly-stabilized fragment of the SOURCE
+        transcript as a continuation of what's already been committed for
+        this phrase -- text-only, no audio involved (the audio was already
+        turned into text by transcribe_partial; re-sending it here would be
+        redundant and slower). Deliberately told NOT to retranslate
+        already_committed_translation, and that the source fragment may end
+        mid-sentence -- both are expected/normal here, not errors."""
+        source_name = _LANGUAGE_NAMES.get(self._source_lang, self._source_lang)
+        target_name = _LANGUAGE_NAMES.get(self._target_lang, self._target_lang)
+
+        if already_committed_translation:
+            context_clause = (
+                f"So far, this much has already been translated into {target_name} and "
+                f"spoken aloud: \"{already_committed_translation}\". Do NOT repeat, "
+                f"retranslate, or rephrase that part -- it's already done and already "
+                f"spoken.\n\n"
+            )
+        else:
+            context_clause = ""
+
+        prompt = (
+            f"You are live-translating a sentence from {source_name} into {target_name} "
+            f"as it's being spoken, word by word, before the speaker has finished.\n\n"
+            f"{context_clause}"
+            f"Here is the NEXT new fragment of the source ({source_name}) transcript, "
+            f"which may end mid-sentence or mid-clause -- that's expected:\n"
+            f"\"{new_stable_text}\"\n\n"
+            f"Translate ONLY this new fragment, as a natural CONTINUATION of what's "
+            f"already been translated (so the combined result reads as one coherent "
+            f"sentence once both parts are joined), the way a live interpreter "
+            f"continues speaking as new words arrive rather than waiting for the whole "
+            f"sentence. Use the same natural, idiomatic, spoken register as a live "
+            f"interpreter (not a formal document translation) -- see the guidance an "
+            f"interpreter follows for the full sentence. Keep numbers, dates, times, "
+            f"personal names, and company/product names exactly as they refer to. If "
+            f"the fragment is too short or ambiguous to translate confidently on its "
+            f"own (e.g. it's just the start of a name or a dangling word), return your "
+            f"best reasonable guess rather than an empty string -- a slightly rough "
+            f"partial is fine here, since the final authoritative translation is "
+            f"computed separately once the whole sentence is done."
+        )
+        return self._call_gemini(prompt, _PartialTranslationResult)
 
     def _synthesize_chunk(self, text: str) -> Optional[bytes]:
         """
