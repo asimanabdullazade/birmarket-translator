@@ -3,6 +3,13 @@ import { BACKEND_WS_URL, AUDIO_SAMPLE_RATE } from "../config.js";
 import { MicCapture } from "../audio/audioCapture.js";
 import { TranslationAudioPlayer } from "../audio/audioPlayback.js";
 
+// Phase 9 (error recovery): reconnect backoff shape -- exponential, capped,
+// with a hard attempt limit before giving up and surfacing a terminal
+// error. See "Reconnection" below.
+const MAX_RECONNECT_ATTEMPTS = 5;
+const RECONNECT_BASE_DELAY_MS = 500;
+const RECONNECT_MAX_DELAY_MS = 8000;
+
 /**
  * Owns the WebSocket connection, the mic capture pipeline, and the
  * status/transcript/translation state driven by server messages -- see
@@ -47,14 +54,62 @@ import { TranslationAudioPlayer } from "../audio/audioPlayback.js";
  * backend/websocket/handlers.py can log a complete start-to-finish
  * latency breakdown for that phrase. See "Measuring latency" in the
  * README.
+ *
+ * Pause/resume (Phase 9)
+ * -----------------------
+ * `pause()`/`resume()` send the matching control message (see
+ * PauseMessage/ResumeMessage in backend/models/schemas.py), gate the mic
+ * (MicCapture.pause()/resume() in audioCapture.js), and optimistically set
+ * status locally -- the same "set it immediately, let the server's own
+ * status message confirm it shortly after" pattern `stop()` already uses
+ * for "idle". `pausedRef` mirrors the paused state for code that can't
+ * wait for a re-render (the reconnect flow below re-asserts pause on the
+ * server after a reconnect, since a reconnect always opens a brand new
+ * backend session with no memory of the old one being paused).
+ *
+ * Original-audio monitor (Phase 9)
+ * -----------------------------------
+ * `originalVolume`/`setOriginalVolume` mirror `volume`/`setVolume`'s
+ * pattern, wired to `MicCapture.setMonitorVolume` (audioCapture.js)
+ * instead of `TranslationAudioPlayer.setVolume` -- lets the user hear
+ * their own mic locally. Defaults to 0 (off); see the feedback-risk
+ * caveat in audioCapture.js's module docstring and the "Original audio"
+ * slider's caption in AudioControls.jsx.
+ *
+ * Reconnection (Phase 9)
+ * -------------------------
+ * There is no session-resumption support on the backend at all (confirmed
+ * by reading backend/main.py -- no session IDs anywhere), so a reconnect
+ * always means: open a new WebSocket, send a fresh `start` with the same
+ * params, and let the backend build a brand-new session. `attachSocketHandlers`
+ * is the shared onopen/onmessage/onerror/onclose wiring used for both the
+ * very first connection and every reconnect, so that logic isn't
+ * duplicated. `intentionalCloseRef` is what tells `onclose` whether a
+ * disconnect was expected (the user clicked Stop) or not (network blip,
+ * server restart, etc.) -- only the latter triggers `attemptReconnect()`.
+ * `onerror` is a deliberate no-op: `onclose` is the single decision point
+ * for idle vs. reconnect vs. terminal error, so nothing here can race or
+ * clobber a more-informed decision onclose is about to make.
+ *
+ * The same `MicCapture` instance (and its already-granted mic permission)
+ * survives across any number of reconnects -- only the WebSocket itself is
+ * re-established; `beginCapture` runs exactly once, on the original
+ * `start()` call. `history`/`livePartial` are likewise preserved across a
+ * reconnect (only `start()` resets them). Known, accepted limitation:
+ * mic audio arriving while the socket is down is dropped, not buffered
+ * (there's no good place to hold it without reinventing VAD client-side),
+ * so a phrase that was mid-utterance exactly when an *unexpected*
+ * disconnect happens is lost -- unlike a user-initiated `pause`, which
+ * always cleanly flushes server-side first.
  */
 export function useTranslationSession() {
-  const [status, setStatus] = useState("idle"); // idle | connected | listening | translating | error
+  const [status, setStatus] = useState("idle"); // idle | connected | listening | translating | paused | reconnecting | error
   const [history, setHistory] = useState([]);
   const [livePartial, setLivePartial] = useState(null); // { timestamp, text } | null
   const [errorMessage, setErrorMessage] = useState(null);
   const [volume, setVolumeState] = useState(1);
   const [muted, setMutedState] = useState(false);
+  const [originalVolume, setOriginalVolumeState] = useState(0);
 
   const socketRef = useRef(null);
   const micRef = useRef(null);
@@ -65,6 +120,21 @@ export function useTranslationSession() {
   // Mirrors `muted` for code that can't wait for a re-render (the `start`
   // callback's `onopen` closure, captured once per call) -- see `start` below.
   const mutedRef = useRef(false);
+  // Mirrors `originalVolume` for the same reason -- re-applied to a freshly
+  // created MicCapture instance in `beginCapture`.
+  const originalVolumeRef = useRef(0);
+  // Phase 9: mirrors the paused state, re-asserted on the server after a
+  // reconnect (see "Reconnection" above).
+  const pausedRef = useRef(false);
+  // Phase 9: true only when the user (or a hard stop) intentionally closed
+  // the socket -- distinguishes an expected close (go idle) from an
+  // unexpected one (reconnect). Set right before `stop()`'s own `close()`.
+  const intentionalCloseRef = useRef(false);
+  // Phase 9: remembers the params from the original `start()` call so a
+  // reconnect can resend an equivalent `start` message.
+  const sessionParamsRef = useRef(null);
+  const reconnectAttemptsRef = useRef(0);
+  const reconnectTimeoutRef = useRef(null);
   // Step 7: phrase timestamps we've already sent an `audio_played` report
   // for, so only the *first* audio chunk of a phrase gets reported (later
   // chunks of a multi-chunk phrase don't need their own latency number).
@@ -103,7 +173,18 @@ export function useTranslationSession() {
     }
   }, []);
 
+  const setOriginalVolume = useCallback((nextVolume) => {
+    setOriginalVolumeState(nextVolume);
+    originalVolumeRef.current = nextVolume;
+    micRef.current?.setMonitorVolume(nextVolume);
+  }, []);
+
   const stop = useCallback(() => {
+    intentionalCloseRef.current = true;
+    if (reconnectTimeoutRef.current) {
+      clearTimeout(reconnectTimeoutRef.current);
+      reconnectTimeoutRef.current = null;
+    }
     if (socketRef.current?.readyState === WebSocket.OPEN) {
       socketRef.current.send(JSON.stringify({ type: "stop" }));
       socketRef.current.close();
@@ -114,8 +195,31 @@ export function useTranslationSession() {
     micRef.current = null;
 
     playerRef.current.stop();
+    pausedRef.current = false;
 
     setStatus("idle");
+  }, []);
+
+  // Phase 9: pause/resume without tearing the session down -- see the
+  // module docstring.
+  const pause = useCallback(() => {
+    pausedRef.current = true;
+    if (socketRef.current?.readyState === WebSocket.OPEN) {
+      socketRef.current.send(JSON.stringify({ type: "pause" }));
+    }
+    micRef.current?.pause();
+    // Optimistic, same pattern stop() already uses for "idle" -- the
+    // server's own `status: paused` message confirms it shortly after.
+    setStatus("paused");
+  }, []);
+
+  const resume = useCallback(() => {
+    pausedRef.current = false;
+    if (socketRef.current?.readyState === WebSocket.OPEN) {
+      socketRef.current.send(JSON.stringify({ type: "resume" }));
+    }
+    micRef.current?.resume();
+    setStatus("listening");
   }, []);
 
   const start = useCallback(
@@ -124,118 +228,186 @@ export function useTranslationSession() {
       setHistory([]);
       setLivePartial(null);
       reportedPhrasesRef.current = new Set();
+      intentionalCloseRef.current = false;
+      reconnectAttemptsRef.current = 0;
+      pausedRef.current = false;
+      sessionParamsRef.current = { sourceLang, targetLang, microphoneId };
+
+      // Shared onopen/onmessage/onerror/onclose wiring for both the
+      // original connection and every reconnect -- see "Reconnection" in
+      // the module docstring.
+      function attachSocketHandlers(socket, { isReconnect = false } = {}) {
+        socket.onopen = () => {
+          const params = sessionParamsRef.current;
+          socket.send(
+            JSON.stringify({
+              type: "start",
+              source_lang: params.sourceLang,
+              target_lang: params.targetLang,
+              sample_rate: AUDIO_SAMPLE_RATE,
+            })
+          );
+          // Sync whatever mute preference carried over from a previous
+          // session (the server always starts a new session unmuted) --
+          // read via the ref, not the `muted` state var, since this
+          // closure was created once when attachSocketHandlers ran and
+          // won't see later re-renders.
+          if (mutedRef.current) {
+            socket.send(JSON.stringify({ type: "set_muted", muted: true }));
+          }
+          if (isReconnect) {
+            reconnectAttemptsRef.current = 0;
+            if (reconnectTimeoutRef.current) {
+              clearTimeout(reconnectTimeoutRef.current);
+              reconnectTimeoutRef.current = null;
+            }
+            // A reconnect always opens a brand-new backend session (no
+            // session-resumption support -- see the module docstring), so
+            // if we were paused before the drop, re-assert it here rather
+            // than silently resuming capture on the new session.
+            if (pausedRef.current) {
+              socket.send(JSON.stringify({ type: "pause" }));
+            }
+          }
+        };
+
+        socket.onmessage = (event) => {
+          const message = JSON.parse(event.data);
+          switch (message.type) {
+            case "status":
+              setStatus(message.status);
+              if (message.status === "error" && message.detail) {
+                setErrorMessage(message.detail);
+              }
+              break;
+            case "transcript":
+              if (message.is_final) {
+                // Phrase is done -- move it into history (the only version
+                // meant to be kept) and drop the live partial for it.
+                upsertEntry(message.timestamp, {
+                  sourceText: message.text,
+                  detectedLanguage: message.detected_language ?? null,
+                });
+                setLivePartial((current) => (current?.timestamp === message.timestamp ? null : current));
+              } else {
+                // Still-in-progress phrase -- replace in place, never append.
+                setLivePartial({ timestamp: message.timestamp, text: message.text });
+              }
+              break;
+            case "translation":
+              // Attach to the matching (existing or not-yet-created) history
+              // entry. `message.text` is always the FULL translation
+              // accumulated so far, whether this is the final version
+              // (is_final: true) or a growing incremental one sent while the
+              // phrase is still being spoken (Phase 8's streaming
+              // translation, is_final: false) -- either way a plain
+              // overwrite is correct and needs no extra handling here, the
+              // same way a growing partial transcript already works above.
+              upsertEntry(message.timestamp, { translationText: message.text });
+              break;
+            case "audio": {
+              // One synthesized-speech chunk for a translated phrase (Step
+              // 6) -- queue it for gapless playback. Not correlated with
+              // `history` by timestamp for display purposes; the player
+              // handles ordering/overlap on its own.
+              const isFirstChunkForPhrase = !reportedPhrasesRef.current.has(message.timestamp);
+              const playedPromise = playerRef.current.enqueue(message.audio_base64);
+              if (isFirstChunkForPhrase) {
+                // Step 7: only the first chunk's actual playback moment is
+                // worth reporting -- see the module docstring above.
+                reportedPhrasesRef.current.add(message.timestamp);
+                playedPromise.then((playedAtMs) => {
+                  if (playedAtMs != null && socketRef.current?.readyState === WebSocket.OPEN) {
+                    socketRef.current.send(
+                      JSON.stringify({ type: "audio_played", timestamp: message.timestamp, played_at_ms: playedAtMs })
+                    );
+                  }
+                });
+              }
+              break;
+            }
+            case "error":
+              setErrorMessage(message.message);
+              break;
+            default:
+              break;
+          }
+        };
+
+        // Deliberate no-op -- see "Reconnection" in the module docstring
+        // for why onclose (not onerror) is the single decision point here.
+        socket.onerror = () => {};
+
+        socket.onclose = () => {
+          if (socketRef.current !== socket) {
+            // A stale socket's close firing after we've already moved on
+            // (e.g. the previous socket, right after a reconnect swapped
+            // in a new one) -- ignore it.
+            return;
+          }
+          if (intentionalCloseRef.current) {
+            micRef.current?.stop();
+            micRef.current = null;
+            setStatus((current) => (current === "error" ? current : "idle"));
+            return;
+          }
+          attemptReconnect();
+        };
+      }
+
+      function attemptReconnect() {
+        if (reconnectAttemptsRef.current >= MAX_RECONNECT_ATTEMPTS) {
+          setStatus("error");
+          setErrorMessage(
+            "Lost connection to the server and couldn't reconnect after several attempts. Click Start to try again."
+          );
+          micRef.current?.stop();
+          micRef.current = null;
+          socketRef.current = null;
+          return;
+        }
+        reconnectAttemptsRef.current += 1;
+        setStatus("reconnecting");
+        const backoffMs = Math.min(
+          RECONNECT_BASE_DELAY_MS * 2 ** (reconnectAttemptsRef.current - 1),
+          RECONNECT_MAX_DELAY_MS
+        );
+        reconnectTimeoutRef.current = setTimeout(() => {
+          reconnectTimeoutRef.current = null;
+          const socket = new WebSocket(BACKEND_WS_URL);
+          socketRef.current = socket;
+          attachSocketHandlers(socket, { isReconnect: true });
+        }, backoffMs);
+      }
 
       const socket = new WebSocket(BACKEND_WS_URL);
       socketRef.current = socket;
-
-      socket.onopen = () => {
-        socket.send(
-          JSON.stringify({
-            type: "start",
-            source_lang: sourceLang,
-            target_lang: targetLang,
-            sample_rate: AUDIO_SAMPLE_RATE,
-          })
-        );
-        // Sync whatever mute preference carried over from a previous
-        // session (the server always starts a new session unmuted) --
-        // read via the ref, not the `muted` state var, since this closure
-        // was created once when `start` was called and won't see later
-        // re-renders.
-        if (mutedRef.current) {
-          socket.send(JSON.stringify({ type: "set_muted", muted: true }));
-        }
-      };
-
-      socket.onmessage = (event) => {
-        const message = JSON.parse(event.data);
-        switch (message.type) {
-          case "status":
-            setStatus(message.status);
-            if (message.status === "error" && message.detail) {
-              setErrorMessage(message.detail);
-            }
-            break;
-          case "transcript":
-            if (message.is_final) {
-              // Phrase is done -- move it into history (the only version
-              // meant to be kept) and drop the live partial for it.
-              upsertEntry(message.timestamp, {
-                sourceText: message.text,
-                detectedLanguage: message.detected_language ?? null,
-              });
-              setLivePartial((current) => (current?.timestamp === message.timestamp ? null : current));
-            } else {
-              // Still-in-progress phrase -- replace in place, never append.
-              setLivePartial({ timestamp: message.timestamp, text: message.text });
-            }
-            break;
-          case "translation":
-            // Attach to the matching (existing or not-yet-created) history
-            // entry. `message.text` is always the FULL translation
-            // accumulated so far, whether this is the final version
-            // (is_final: true) or a growing incremental one sent while the
-            // phrase is still being spoken (Phase 8's streaming
-            // translation, is_final: false) -- either way a plain
-            // overwrite is correct and needs no extra handling here, the
-            // same way a growing partial transcript already works above.
-            upsertEntry(message.timestamp, { translationText: message.text });
-            break;
-          case "audio": {
-            // One synthesized-speech chunk for a translated phrase (Step
-            // 6) -- queue it for gapless playback. Not correlated with
-            // `history` by timestamp for display purposes; the player
-            // handles ordering/overlap on its own.
-            const isFirstChunkForPhrase = !reportedPhrasesRef.current.has(message.timestamp);
-            const playedPromise = playerRef.current.enqueue(message.audio_base64);
-            if (isFirstChunkForPhrase) {
-              // Step 7: only the first chunk's actual playback moment is
-              // worth reporting -- see the module docstring above.
-              reportedPhrasesRef.current.add(message.timestamp);
-              playedPromise.then((playedAtMs) => {
-                if (playedAtMs != null && socketRef.current?.readyState === WebSocket.OPEN) {
-                  socketRef.current.send(
-                    JSON.stringify({ type: "audio_played", timestamp: message.timestamp, played_at_ms: playedAtMs })
-                  );
-                }
-              });
-            }
-            break;
-          }
-          case "error":
-            setErrorMessage(message.message);
-            break;
-          default:
-            break;
-        }
-      };
-
-      socket.onerror = () => {
-        setStatus("error");
-        setErrorMessage("WebSocket connection error");
-      };
-
-      socket.onclose = () => {
-        micRef.current?.stop();
-        micRef.current = null;
-        setStatus((current) => (current === "error" ? current : "idle"));
-      };
+      attachSocketHandlers(socket, { isReconnect: false });
 
       // Start the mic once the socket has sent "start"; audio frames sent
       // before the server processes "start" are harmless to buffer briefly,
-      // but we wait for the socket to be open to avoid dropping them.
+      // but we wait for the socket to be open to avoid dropping them. Runs
+      // exactly once per start() call -- a reconnect re-establishes only
+      // the WebSocket, never this mic/worklet pipeline (see "Reconnection"
+      // in the module docstring).
       const beginCapture = async () => {
         const mic = new MicCapture({
           deviceId: microphoneId,
           onPCMChunk: (arrayBuffer) => {
-            if (socket.readyState === WebSocket.OPEN) {
-              socket.send(arrayBuffer);
+            // Read the CURRENT socket via the ref, not any specific
+            // `socket` value closed over here -- a reconnect swaps in a
+            // new WebSocket without recreating this callback, so closing
+            // over one fixed `socket` would leave this forever checking
+            // an old, closed connection after a reconnect.
+            if (socketRef.current?.readyState === WebSocket.OPEN) {
+              socketRef.current.send(arrayBuffer);
             }
           },
         });
         micRef.current = mic;
         try {
           await mic.start();
+          mic.setMonitorVolume(originalVolumeRef.current);
         } catch (err) {
           setErrorMessage(err.message || "Could not access microphone");
           setStatus("error");
@@ -251,5 +423,20 @@ export function useTranslationSession() {
     [upsertEntry]
   );
 
-  return { status, history, livePartial, errorMessage, volume, setVolume, muted, setMuted, start, stop };
+  return {
+    status,
+    history,
+    livePartial,
+    errorMessage,
+    volume,
+    setVolume,
+    muted,
+    setMuted,
+    originalVolume,
+    setOriginalVolume,
+    start,
+    stop,
+    pause,
+    resume,
+  };
 }

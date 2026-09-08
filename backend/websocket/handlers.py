@@ -159,14 +159,26 @@ that streamed cleanly never re-speaks its own already-played audio. See
 that function's docstring for why this reconciliation is deliberately an
 all-or-nothing decision rather than a fine-grained diff.
 
-Bugfix (found during manual testing): the authoritative final translation
-is what's supposed to correct anything shown so far for a phrase -- but if
-it comes back completely EMPTY (a short trailing bit of audio VAD
-segmented as its own phrase, which the authoritative pass correctly
-recognizes as no real speech) while something WAS incrementally committed
-and already displayed, nothing else ever corrected it, leaving a
-translation with no matching source text stuck on screen. See the explicit
-empty-final-translation handling in the "final" branch below.
+Pause/resume and source-language auto-detect (Phase 9)
+--------------------------------------------------------
+`pause`/`resume` (see PauseMessage/ResumeMessage in schemas.py) let the
+client stop/restart capture without tearing the session down. `pause`
+reuses the exact same finalize path `stop` already uses (`segmenter.flush()`
+-> `enqueue_final`, so any in-progress phrase is still transcribed/
+translated/spoken) but leaves the provider session and WebSocket open;
+`session_paused` then makes the binary-frame branch below silently drop
+any stray frame (the frontend is also expected to stop sending). Both
+messages reset the gap-detector's `last_frame_at`/`last_frame_bytes` so
+resuming doesn't immediately log a spurious "audio gap" warning for the
+pause duration itself. Neither message touches `phrase_streaming_state`,
+`latency`, or `translation_muted` -- those are independent of pause state.
+
+`source_lang == "auto"` is accepted only for providers in
+`_AUTO_SOURCE_LANG_PROVIDERS` (gemini/mock/gemini_live) -- see that
+constant below and gemini_provider.py's conditional prompt framing.
+Deliberately kept out of config/languages.py's SUPPORTED_LANGUAGES so it
+can never be sent/accepted as a *target* language and never needs a
+display name.
 
 Latency breakdown (Step 7)
 ---------------------------
@@ -218,6 +230,8 @@ from backend.models.schemas import (
     AudioMessage,
     AudioPlayedMessage,
     ErrorMessage,
+    PauseMessage,
+    ResumeMessage,
     SetMutedMessage,
     StartMessage,
     StatusMessage,
@@ -248,6 +262,15 @@ GAP_WARNING_SECONDS = 1.0
 
 # Sentinel put on the processing queue to tell the consumer task to stop.
 _STOP = object()
+
+# Phase 9: providers that can plausibly accept source_lang == "auto" and do
+# something real with it. See "Pause/resume and source-language auto-detect"
+# above and gemini_provider.py's conditional prompt framing for
+# "gemini"/"mock". "gemini_live" is included because Live Translate already
+# always auto-detects the source language server-side regardless of what's
+# passed in (see live_handlers.py) -- "auto" is simply the honest label for
+# that reality rather than a new capability being added for it here.
+_AUTO_SOURCE_LANG_PROVIDERS = {"gemini", "mock", "gemini_live"}
 
 
 def _now_iso() -> str:
@@ -437,6 +460,10 @@ async def handle_connection(websocket: WebSocket, settings: Settings) -> None:
     source_lang = ""
     target_lang = ""
     session_active = False
+    # Phase 9: session stays open/active while paused -- see "Pause/resume
+    # and source-language auto-detect" above. Reset to False on both start
+    # and stop.
+    session_paused = False
 
     debug_session_dir: Optional[Path] = None
     raw_dump: Optional[wave.Wave_write] = None
@@ -717,9 +744,26 @@ async def handle_connection(websocket: WebSocket, settings: Settings) -> None:
                     continue
 
                 if isinstance(parsed, StartMessage):
-                    if not is_supported(parsed.source_lang) or not is_supported(parsed.target_lang):
+                    # Phase 9: "auto" bypasses the normal is_supported()
+                    # check (it's deliberately not in SUPPORTED_LANGUAGES --
+                    # see "Pause/resume and source-language auto-detect"
+                    # above) but is only accepted for providers that can
+                    # actually do something with it.
+                    source_lang_ok = parsed.source_lang == "auto" or is_supported(parsed.source_lang)
+                    if not source_lang_ok or not is_supported(parsed.target_lang):
                         await _safe_send(
                             websocket, ErrorMessage(message="Unsupported source or target language").model_dump_json()
+                        )
+                        continue
+                    if parsed.source_lang == "auto" and settings.translation_provider not in _AUTO_SOURCE_LANG_PROVIDERS:
+                        await _safe_send(
+                            websocket,
+                            ErrorMessage(
+                                message=(
+                                    f"Source-language auto-detect isn't supported for the "
+                                    f"'{settings.translation_provider}' provider"
+                                )
+                            ).model_dump_json(),
                         )
                         continue
 
@@ -745,6 +789,7 @@ async def handle_connection(websocket: WebSocket, settings: Settings) -> None:
                     provider = get_provider(settings)
                     await provider.start_session(source_lang, target_lang)
                     session_active = True
+                    session_paused = False
                     last_frame_at = None
                     last_frame_bytes = None
                     last_partial_text = None
@@ -771,7 +816,29 @@ async def handle_connection(websocket: WebSocket, settings: Settings) -> None:
                         raw_dump.close()
                         raw_dump = None
                     session_active = False
+                    session_paused = False
                     await _safe_send(websocket, StatusMessage(status="connected").model_dump_json())
+
+                elif isinstance(parsed, PauseMessage):
+                    if session_active and not session_paused and segmenter is not None:
+                        remainder = segmenter.flush()
+                        if remainder:
+                            enqueue_final(remainder, segmenter.sample_rate)
+                        session_paused = True
+                        # Avoid a spurious "audio gap" warning covering the
+                        # pause duration once frames resume.
+                        last_frame_at = None
+                        last_frame_bytes = None
+                        logger.info("Session paused")
+                        await _safe_send(websocket, StatusMessage(status="paused").model_dump_json())
+
+                elif isinstance(parsed, ResumeMessage):
+                    if session_active and session_paused:
+                        session_paused = False
+                        last_frame_at = None
+                        last_frame_bytes = None
+                        logger.info("Session resumed")
+                        await _safe_send(websocket, StatusMessage(status="listening").model_dump_json())
 
                 elif isinstance(parsed, SetMutedMessage):
                     translation_muted = parsed.muted
@@ -787,6 +854,13 @@ async def handle_connection(websocket: WebSocket, settings: Settings) -> None:
                     await _safe_send(
                         websocket, ErrorMessage(message="Received audio before a start message").model_dump_json()
                     )
+                    continue
+
+                if session_paused:
+                    # Defense in depth -- the frontend is expected to stop
+                    # sending frames while paused; silently drop any that
+                    # race the pause message rather than feeding them to a
+                    # segmenter that's supposed to be idle.
                     continue
 
                 data = message["bytes"]
