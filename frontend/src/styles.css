@@ -86,6 +86,11 @@ select {
   color: #fff;
 }
 
+.btn-pause {
+  background: #4285f4;
+  color: #fff;
+}
+
 .status-row {
   display: flex;
   align-items: center;
@@ -120,6 +125,25 @@ select {
   background: #b3261e;
 }
 
+.status-paused {
+  background: #9aa0a6;
+}
+
+.status-reconnecting {
+  background: #f4a300;
+  animation: status-reconnecting-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes status-reconnecting-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
 .status-error-detail {
   color: #b3261e;
   font-size: 0.8rem;
@@ -131,12 +155,13 @@ select {
   margin: 0;
 }
 
-/* Step 6: volume/mute for the synthesized translation audio. */
+/* Step 6 / Phase 9: translation/captions toggles + volume sliders, as a
+   grouped column stack (four rows) matching the provided UI mockup. */
 
 .audio-controls {
   display: flex;
-  align-items: center;
-  gap: 12px;
+  flex-direction: column;
+  gap: 10px;
   font-size: 0.85rem;
 }
 
@@ -154,8 +179,39 @@ select {
   opacity: 0.6;
 }
 
-.btn-mute {
-  padding: 6px 12px;
+.toggle-row,
+.slider-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.slider-row {
+  flex-wrap: wrap;
+}
+
+.slider-row .field-label {
+  flex: 0 0 auto;
+  min-width: 110px;
+}
+
+.slider-row input[type="range"] {
+  flex: 1;
+}
+
+.field-hint {
+  flex-basis: 100%;
+  margin: 0;
+  color: #888;
+  font-size: 0.78rem;
+}
+
+.toggle-row .field-label {
+  flex: 1;
+}
+
+.btn-toggle {
+  padding: 6px 14px;
   border-radius: 8px;
   border: 1px solid #ccced4;
   background: #fff;
@@ -164,11 +220,12 @@ select {
   color: #1c1e21;
   cursor: pointer;
   white-space: nowrap;
+  min-width: 56px;
 }
 
-.btn-mute-active {
-  background: #b3261e;
-  border-color: #b3261e;
+.btn-toggle-on {
+  background: #2f7d3f;
+  border-color: #2f7d3f;
   color: #fff;
 }
 

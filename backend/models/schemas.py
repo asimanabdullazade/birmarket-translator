@@ -20,9 +20,16 @@ from typing import Annotated, Literal, Optional, Union
 
 from pydantic import BaseModel, Field, TypeAdapter
 
-# --- Status enum, mirrors the four states the UI shows ---
+# --- Status enum, mirrors the states the UI shows ---
+#
+# "paused" is Phase 9 (conversation mode): the session stays open (provider
+# session, WebSocket) but no audio is being captured/forwarded. Note
+# "reconnecting" is a deliberately *frontend-only* synthetic status (see
+# frontend/src/hooks/useWebSocket.js) -- the server never sends it, since
+# from the server's point of view a reconnect is just a brand new
+# connection/session, it never observes the gap itself.
 
-StatusValue = Literal["connected", "listening", "translating", "error"]
+StatusValue = Literal["connected", "listening", "translating", "paused", "error"]
 
 
 # --- Client -> server control messages ---
@@ -37,6 +44,21 @@ class StartMessage(BaseModel):
 
 class StopMessage(BaseModel):
     type: Literal["stop"] = "stop"
+
+
+class PauseMessage(BaseModel):
+    """Phase 9 (conversation mode): pause capture/translation without
+    ending the session -- the in-progress phrase (if any) is finalized
+    exactly as a "stop" would finalize it, but the provider session and
+    WebSocket both stay open so "resume" can pick back up without a full
+    restart. See "Pause/resume" in backend/websocket/handlers.py's
+    docstring."""
+
+    type: Literal["pause"] = "pause"
+
+
+class ResumeMessage(BaseModel):
+    type: Literal["resume"] = "resume"
 
 
 class SetMutedMessage(BaseModel):
@@ -75,7 +97,15 @@ class AudioPlayedMessage(BaseModel):
 
 
 ClientMessage = Annotated[
-    Union[StartMessage, StopMessage, SetMutedMessage, AudioPlayedMessage], Field(discriminator="type")
+    Union[
+        StartMessage,
+        StopMessage,
+        PauseMessage,
+        ResumeMessage,
+        SetMutedMessage,
+        AudioPlayedMessage,
+    ],
+    Field(discriminator="type"),
 ]
 
 _client_message_adapter: TypeAdapter[ClientMessage] = TypeAdapter(ClientMessage)

@@ -227,8 +227,26 @@ class GeminiTranslationProvider(TranslationProvider):
             return None
 
     def _transcribe_and_translate(self, pcm16_bytes: bytes) -> Optional[_TranscriptionResult]:
-        source_name = _LANGUAGE_NAMES.get(self._source_lang, self._source_lang)
         target_name = _LANGUAGE_NAMES.get(self._target_lang, self._target_lang)
+
+        # Phase 9: source_lang == "auto" (only ever set for this provider
+        # via _AUTO_SOURCE_LANG_PROVIDERS in backend/websocket/handlers.py)
+        # swaps the "spoken in X" framing for one that asks Gemini to
+        # identify the language itself -- otherwise _LANGUAGE_NAMES.get(...)
+        # falls through to the literal string "auto" and produces prompts
+        # like "spoken in auto", which is wrong instruction, not just an
+        # ugly one.
+        if self._source_lang == "auto":
+            source_clause = (
+                "First identify the spoken language in the attached audio. Then "
+                "transcribe exactly what is said, in that same language."
+            )
+        else:
+            source_name = _LANGUAGE_NAMES.get(self._source_lang, self._source_lang)
+            source_clause = (
+                f"The attached audio is spoken in {source_name}. First transcribe "
+                f"exactly what is said, in {source_name}."
+            )
 
         # Step 5: the translation half of this prompt is deliberately tuned
         # for *spoken* output, not a formal document translation -- see
@@ -241,8 +259,7 @@ class GeminiTranslationProvider(TranslationProvider):
         # names verbatim rather than risk the model "translating" or
         # mistranslating something that shouldn't change meaning at all.
         prompt = (
-            f"The attached audio is spoken in {source_name}. First transcribe exactly "
-            f"what is said, in {source_name}. Then translate that transcript into "
+            f"{source_clause} Then translate that transcript into "
             f"{target_name}.\n\n"
             f"Translate the way a skilled human interpreter would in a live business "
             f"meeting, not the way a document translator would: natural, idiomatic, "
@@ -264,17 +281,25 @@ class GeminiTranslationProvider(TranslationProvider):
         return self._call_gemini(prompt, _TranscriptionResult, pcm16_bytes=pcm16_bytes)
 
     def _transcribe_only(self, pcm16_bytes: bytes) -> Optional[_PartialTranscriptionResult]:
-        source_name = _LANGUAGE_NAMES.get(self._source_lang, self._source_lang)
-
         # Deliberately cheaper than _transcribe_and_translate: no
         # translation is requested, since partial results are for live
         # transcript feedback only and are never translated (see
         # TranslationProvider.transcribe_partial in base.py) -- this call
         # may run several times per utterance as speech continues, so
         # keeping it minimal matters more here than for the one-shot final.
+        if self._source_lang == "auto":
+            source_clause = (
+                "Identify the spoken language in the attached audio and transcribe "
+                "exactly what is said so far, in that same language"
+            )
+        else:
+            source_name = _LANGUAGE_NAMES.get(self._source_lang, self._source_lang)
+            source_clause = (
+                f"The attached audio is spoken in {source_name}. Transcribe exactly "
+                f"what is said so far, in {source_name}"
+            )
         prompt = (
-            f"The attached audio is spoken in {source_name}. Transcribe exactly what "
-            f"is said so far, in {source_name} -- it may be a partial, unfinished "
+            f"{source_clause} -- it may be a partial, unfinished "
             "sentence, that's expected. If there's no discernible speech yet, return "
             "an empty string."
         )
@@ -290,8 +315,23 @@ class GeminiTranslationProvider(TranslationProvider):
         redundant and slower). Deliberately told NOT to retranslate
         already_committed_translation, and that the source fragment may end
         mid-sentence -- both are expected/normal here, not errors."""
-        source_name = _LANGUAGE_NAMES.get(self._source_lang, self._source_lang)
         target_name = _LANGUAGE_NAMES.get(self._target_lang, self._target_lang)
+
+        if self._source_lang == "auto":
+            source_intro = (
+                f"You are live-translating a sentence into {target_name} as it's "
+                f"being spoken, word by word, before the speaker has finished. "
+                f"Identify the source language from the fragment itself."
+            )
+            fragment_label = "source-language"
+        else:
+            source_name = _LANGUAGE_NAMES.get(self._source_lang, self._source_lang)
+            source_intro = (
+                f"You are live-translating a sentence from {source_name} into "
+                f"{target_name} as it's being spoken, word by word, before the "
+                f"speaker has finished."
+            )
+            fragment_label = source_name
 
         if already_committed_translation:
             context_clause = (
@@ -304,10 +344,9 @@ class GeminiTranslationProvider(TranslationProvider):
             context_clause = ""
 
         prompt = (
-            f"You are live-translating a sentence from {source_name} into {target_name} "
-            f"as it's being spoken, word by word, before the speaker has finished.\n\n"
+            f"{source_intro}\n\n"
             f"{context_clause}"
-            f"Here is the NEXT new fragment of the source ({source_name}) transcript, "
+            f"Here is the NEXT new fragment of the {fragment_label} transcript, "
             f"which may end mid-sentence or mid-clause -- that's expected:\n"
             f"\"{new_stable_text}\"\n\n"
             f"Translate ONLY this new fragment, as a natural CONTINUATION of what's "

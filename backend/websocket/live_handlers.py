@@ -195,6 +195,8 @@ from pydantic import ValidationError
 from backend.models.schemas import (
     AudioMessage,
     ErrorMessage,
+    PauseMessage,
+    ResumeMessage,
     SetMutedMessage,
     StatusMessage,
     StopMessage,
@@ -232,6 +234,11 @@ class _SharedState:
     knows or waits for reconnects itself."""
 
     muted: bool = False
+    # Phase 9: mirrors `muted`'s "stop forwarding audio entirely" behavior
+    # (see "Mute" in the module docstring) -- without this, clicking Pause
+    # during a gemini_live session would show "Paused" in the UI while
+    # audio kept streaming to (and being billed by) Gemini underneath.
+    paused: bool = False
     stop_requested: bool = False
     session: Optional[object] = None  # google.genai.live.AsyncSession, kept untyped to avoid a module-level SDK import
 
@@ -306,9 +313,10 @@ async def _sender(websocket: WebSocket, shared: _SharedState, sample_rate: int) 
             return
 
         if "bytes" in message and message["bytes"] is not None:
-            if shared.muted or shared.session is None:
-                # Muted: never forward audio into a billed session at all
-                # (see "Mute" in the module docstring). No live session
+            if shared.muted or shared.paused or shared.session is None:
+                # Muted or paused: never forward audio into a billed
+                # session at all (see "Mute" in the module docstring --
+                # pause follows the identical reasoning). No live session
                 # right now (startup/reconnecting): drop rather than
                 # buffer -- this mode has no utterance boundaries to
                 # buffer *to*, so there's no good place to hold audio
@@ -339,6 +347,12 @@ async def _sender(websocket: WebSocket, shared: _SharedState, sample_rate: int) 
             if isinstance(parsed, SetMutedMessage):
                 shared.muted = parsed.muted
                 logger.info("Gemini Live: audio forwarding %s", "muted" if shared.muted else "unmuted")
+            if isinstance(parsed, PauseMessage):
+                shared.paused = True
+                logger.info("Gemini Live: paused")
+            if isinstance(parsed, ResumeMessage):
+                shared.paused = False
+                logger.info("Gemini Live: resumed")
 
 
 async def _receiver(
@@ -360,11 +374,16 @@ async def _receiver(
     from google.genai import types
 
     client = genai.Client(api_key=settings.gemini_api_key)
+    # language_codes is a *hint* for auto-detection, not a hard source
+    # language -- see "Source language" in the module docstring (this mode
+    # always auto-detects regardless). When the UI's source selector is
+    # itself set to "auto" (Phase 9), omit the kwarg entirely rather than
+    # pass the literal string "auto" through as a BCP-47 hint -- that's
+    # untested against the real API and risks a 400 at connect time.
+    input_audio_transcription_kwargs = {} if source_lang == "auto" else {"language_codes": [source_lang]}
     live_config = types.LiveConnectConfig(
         response_modalities=["AUDIO"],
-        # language_codes is a *hint* for auto-detection, not a hard source
-        # language -- see "Source language" in the module docstring.
-        input_audio_transcription=types.AudioTranscriptionConfig(language_codes=[source_lang]),
+        input_audio_transcription=types.AudioTranscriptionConfig(**input_audio_transcription_kwargs),
         output_audio_transcription=types.AudioTranscriptionConfig(),
         translation_config=types.TranslationConfig(target_language_code=target_lang, echo_target_language=False),
     )
