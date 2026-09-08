@@ -10,6 +10,24 @@ const MAX_RECONNECT_ATTEMPTS = 5;
 const RECONNECT_BASE_DELAY_MS = 500;
 const RECONNECT_MAX_DELAY_MS = 8000;
 
+// Phase 10 follow-up (audio feedback): extra time to keep the mic gated
+// after translated audio *should* have finished playing, before resuming
+// forwarding -- covers residual echo tail, especially over Bluetooth
+// headsets where round-trip latency can outrun the browser's own
+// echo-cancellation estimate. See "Mic gating during playback" below.
+const PLAYBACK_GATE_COOLDOWN_MS = 400;
+
+// Phase 10 follow-up: hard ceiling on how long a single playback gate can
+// last, computed delay be damned -- same "never trust a computed timer
+// alone" idiom as GEMINI_LIVE_MAX_PHRASE_SECONDS elsewhere in this app.
+// getPlaybackEndsAt()'s delay is derived from AudioContext timing that this
+// code doesn't fully control (tab throttling, a mis-decoded segment, clock
+// drift over a long session) -- if that estimate is ever wrong in a way
+// that makes the gate outlive the audio, this guarantees the mic un-gates
+// on its own within a few seconds regardless, rather than staying silent
+// for the rest of the session.
+const MAX_PLAYBACK_GATE_MS = 8000;
+
 /**
  * Owns the WebSocket connection, the mic capture pipeline, and the
  * status/transcript/translation state driven by server messages -- see
@@ -76,6 +94,39 @@ const RECONNECT_MAX_DELAY_MS = 8000;
  * caveat in audioCapture.js's module docstring and the "Original audio"
  * slider's caption in AudioControls.jsx.
  *
+ * Mic gating during playback (Phase 10 follow-up)
+ * ---------------------------------------------------
+ * Real-world testing (even over headphones -- AirPods specifically) showed
+ * the mic can still pick up some of the app's own translated audio output,
+ * and -- because Gemini's transcription is a generative LLM rather than a
+ * traditional deterministic decoder -- it doesn't just mis-hear that as
+ * gibberish, it can hallucinate a plausible-sounding "reply" to what it
+ * just heard, i.e. the app appears to talk to itself. Phase 10's headphone
+ * requirement alone doesn't prevent this (Bluetooth's variable round-trip
+ * latency can outrun the browser's `echoCancellation: true` estimate), so
+ * this adds a second, independent layer: stop forwarding mic frames to the
+ * server for as long as translated audio is actually queued/playing (via
+ * `TranslationAudioPlayer.getPlaybackEndsAt()`), plus `PLAYBACK_GATE_COOLDOWN_MS`
+ * afterward as a buffer for lingering echo, capped overall at
+ * `MAX_PLAYBACK_GATE_MS` so a bad timing estimate can never leave the mic
+ * gated for the rest of the session -- it self-heals within a few seconds
+ * at worst. `micGatedForPlaybackRef` is
+ * checked in `beginCapture`'s `onPCMChunk` right alongside the existing
+ * socket-open check -- deliberately a pure client-side send suppression,
+ * NOT a `pause`/`resume` control message: it fires every single phrase
+ * (unlike a user pause), so round-tripping it through the backend's
+ * pause/resume state machine (which also flushes the segmenter -- see
+ * PauseMessage in backend/models/schemas.py) would be both unnecessary and
+ * disruptive to an utterance the user might resume mid-thought right after
+ * the translated audio ends. The one accepted side effect: the backend's
+ * gap-detector (`GAP_WARNING_SECONDS` in backend/websocket/handlers.py)
+ * isn't told about this gate, so it will log a benign "possible audio gap"
+ * warning for each gated stretch -- harmless, log-only, not worth a
+ * protocol change to silence. Known, accepted limitation: real speech from
+ * the user *during* playback is also dropped, not just echo -- same
+ * "half-duplex" trade-off a walkie-talkie makes, and the right one here
+ * given the goal is preventing feedback, not transcribing talk-over.
+ *
  * Reconnection (Phase 9)
  * -------------------------
  * There is no session-resumption support on the backend at all (confirmed
@@ -135,6 +186,11 @@ export function useTranslationSession() {
   const sessionParamsRef = useRef(null);
   const reconnectAttemptsRef = useRef(0);
   const reconnectTimeoutRef = useRef(null);
+  // Phase 10 follow-up: true while translated audio is queued/playing --
+  // gates mic forwarding (not capture itself) to prevent feedback. See
+  // "Mic gating during playback" above.
+  const micGatedForPlaybackRef = useRef(false);
+  const micGateTimeoutRef = useRef(null);
   // Step 7: phrase timestamps we've already sent an `audio_played` report
   // for, so only the *first* audio chunk of a phrase gets reported (later
   // chunks of a multi-chunk phrase don't need their own latency number).
@@ -197,6 +253,14 @@ export function useTranslationSession() {
     playerRef.current.stop();
     pausedRef.current = false;
 
+    // Phase 10 follow-up: don't leave a stale gate (or its timer) armed
+    // into the next session.
+    if (micGateTimeoutRef.current) {
+      clearTimeout(micGateTimeoutRef.current);
+      micGateTimeoutRef.current = null;
+    }
+    micGatedForPlaybackRef.current = false;
+
     setStatus("idle");
   }, []);
 
@@ -231,6 +295,11 @@ export function useTranslationSession() {
       intentionalCloseRef.current = false;
       reconnectAttemptsRef.current = 0;
       pausedRef.current = false;
+      if (micGateTimeoutRef.current) {
+        clearTimeout(micGateTimeoutRef.current);
+        micGateTimeoutRef.current = null;
+      }
+      micGatedForPlaybackRef.current = false;
       sessionParamsRef.current = { sourceLang, targetLang, microphoneId };
 
       // Shared onopen/onmessage/onerror/onclose wiring for both the
@@ -312,6 +381,34 @@ export function useTranslationSession() {
               // handles ordering/overlap on its own.
               const isFirstChunkForPhrase = !reportedPhrasesRef.current.has(message.timestamp);
               const playedPromise = playerRef.current.enqueue(message.audio_base64);
+
+              // Phase 10 follow-up: gate the mic the instant we know more
+              // translated audio is coming -- don't wait for it to actually
+              // start playing (decodeAudioData is async; better to over-gate
+              // by a few ms than risk a race where a frame slips through).
+              // The precise ungate timing is only knowable once enqueue()'s
+              // promise settles (TranslationAudioPlayer has updated
+              // getPlaybackEndsAt() by then -- see its own docstring on
+              // why that read can't happen synchronously here). Re-arming
+              // the timeout on every chunk (not just the first) is what
+              // makes a multi-chunk phrase keep the mic gated for the
+              // *whole* phrase's audio, not just the first chunk's.
+              micGatedForPlaybackRef.current = true;
+              playedPromise.then(() => {
+                if (micGateTimeoutRef.current) {
+                  clearTimeout(micGateTimeoutRef.current);
+                }
+                const endsAt = playerRef.current.getPlaybackEndsAt();
+                const delay = Math.min(
+                  Math.max(0, endsAt - Date.now()) + PLAYBACK_GATE_COOLDOWN_MS,
+                  MAX_PLAYBACK_GATE_MS
+                );
+                micGateTimeoutRef.current = setTimeout(() => {
+                  micGateTimeoutRef.current = null;
+                  micGatedForPlaybackRef.current = false;
+                }, delay);
+              });
+
               if (isFirstChunkForPhrase) {
                 // Step 7: only the first chunk's actual playback moment is
                 // worth reporting -- see the module docstring above.
@@ -399,7 +496,12 @@ export function useTranslationSession() {
             // new WebSocket without recreating this callback, so closing
             // over one fixed `socket` would leave this forever checking
             // an old, closed connection after a reconnect.
-            if (socketRef.current?.readyState === WebSocket.OPEN) {
+            //
+            // Phase 10 follow-up: also withhold frames while translated
+            // audio is playing back, so the mic can't feed the app's own
+            // output back into transcription -- see "Mic gating during
+            // playback" in the module docstring.
+            if (socketRef.current?.readyState === WebSocket.OPEN && !micGatedForPlaybackRef.current) {
               socketRef.current.send(arrayBuffer);
             }
           },
