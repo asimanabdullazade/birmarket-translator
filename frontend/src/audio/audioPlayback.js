@@ -23,6 +23,10 @@
  * Intentionally independent of MicCapture's AudioContext (audio/
  * audioCapture.js) -- one captures mic input, this one plays back
  * synthesized speech, and there's no reason to couple their lifecycles.
+ * (Phase 10 follow-up: hooks/useWebSocket.js reads `getPlaybackEndsAt()`
+ * to gate mic forwarding while this is playing -- see "Mic gating during
+ * playback" there -- but that's a one-way read, not a real coupling: this
+ * class has no idea the mic exists.)
  */
 export class TranslationAudioPlayer {
   constructor() {
@@ -32,6 +36,11 @@ export class TranslationAudioPlayer {
     this.volume = 1;
     this.muted = false;
     this._chain = Promise.resolve();
+    // Phase 10 follow-up: wall-clock (Date.now()-based) estimate of when
+    // everything currently enqueued will finish playing -- see
+    // getPlaybackEndsAt(). Same wall-clock-via-AudioContext-delay trick
+    // enqueue()'s own return value already uses for Step 7.
+    this._playbackEndsAt = 0;
   }
 
   _ensureContext() {
@@ -104,7 +113,8 @@ export class TranslationAudioPlayer {
     // overlapping the previous one.
     const startAt = Math.max(this.nextStartTime, audioContext.currentTime);
     source.start(startAt);
-    this.nextStartTime = startAt + audioBuffer.duration;
+    const endAt = startAt + audioBuffer.duration;
+    this.nextStartTime = endAt;
 
     // Step 7: AudioContext's clock has no fixed relationship to
     // Date.now() by itself, but the *delay* between "now" and `startAt`
@@ -112,7 +122,30 @@ export class TranslationAudioPlayer {
     // Date.now() plus that delay is a fair wall-clock estimate of when
     // this segment actually starts being audible, including any queueing
     // wait behind a still-playing earlier segment.
-    return Date.now() + Math.max(0, (startAt - audioContext.currentTime) * 1000);
+    const playedAtMs = Date.now() + Math.max(0, (startAt - audioContext.currentTime) * 1000);
+
+    // Phase 10 follow-up: same trick, but for when this segment (and thus
+    // everything queued so far) finishes -- see getPlaybackEndsAt(). Uses
+    // Math.max, not a plain assignment, purely as defense-in-depth: startAt
+    // is already derived from nextStartTime so segments should never
+    // resolve out of order here, but a resolve-order surprise should never
+    // be able to *shrink* the tracked end time.
+    const endsAtMs = Date.now() + Math.max(0, (endAt - audioContext.currentTime) * 1000);
+    this._playbackEndsAt = Math.max(this._playbackEndsAt, endsAtMs);
+
+    return playedAtMs;
+  }
+
+  /**
+   * Phase 10 follow-up: wall-clock ms estimate of when all currently
+   * enqueued/playing audio will finish -- 0 (already "in the past") if
+   * nothing has ever been enqueued or everything queued has finished.
+   * Callers should re-check this shortly after `enqueue()`'s returned
+   * promise resolves, not at call time -- see the caller in
+   * hooks/useWebSocket.js for why.
+   */
+  getPlaybackEndsAt() {
+    return this._playbackEndsAt;
   }
 
   /** Stop everything scheduled/playing and reset the queue (e.g. on Stop). */
@@ -121,6 +154,7 @@ export class TranslationAudioPlayer {
     this.audioContext = null;
     this.gainNode = null;
     this.nextStartTime = 0;
+    this._playbackEndsAt = 0;
     this._chain = Promise.resolve();
     // volume/muted are deliberately NOT reset here -- they're a user
     // preference that should carry over into the next session.

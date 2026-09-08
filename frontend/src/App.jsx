@@ -27,6 +27,16 @@ export default function App() {
   // below, also hides translated caption text) -- this hides the whole
   // transcript panel regardless of translation state.
   const [captionsOn, setCaptionsOn] = useState(true);
+  // Phase 10: without headphones, translated audio played through speakers
+  // can be picked up by the mic and re-translated -- a feedback loop (see
+  // "Prevent audio feedback" in the README). There's no reliable browser
+  // API to actually detect whether headphones are in use, so this is a
+  // blocking self-attestation checkbox, not real enforcement -- the MVP
+  // scope is "require headphones" via UX, not acoustic echo cancellation
+  // (flagged as a later phase). Deliberately plain useState, not reset
+  // anywhere -- confirming once per page load is enough; re-prompting on
+  // every Stop/Start would just be friction for repeat testing.
+  const [headphonesConfirmed, setHeadphonesConfirmed] = useState(false);
 
   const { microphones, outputs, permissionError } = useAudioDevices();
   const {
@@ -118,6 +128,25 @@ export default function App() {
 
         {permissionError && <p className="permission-warning">Microphone access needed: {permissionError}</p>}
 
+        {/* Phase 10: blocking headphones acknowledgment -- see the state
+            comment above. Disabled (not just cosmetic) while a session is
+            running, same as the language/device selectors above. */}
+        <div className="headphones-gate">
+          <label className="headphones-gate-label">
+            <input
+              type="checkbox"
+              checked={headphonesConfirmed}
+              onChange={(event) => setHeadphonesConfirmed(event.target.checked)}
+              disabled={isRunning}
+            />
+            I'm using headphones
+          </label>
+          <p className="headphones-gate-hint">
+            Required to start a session. Without headphones, translated audio from your speakers can be
+            picked up by the microphone and translated again, causing a feedback loop.
+          </p>
+        </div>
+
         <Controls
           isRunning={isRunning}
           isPaused={isPaused}
@@ -125,7 +154,7 @@ export default function App() {
           onStop={stop}
           onPause={pause}
           onResume={resume}
-          startDisabled={!!permissionError}
+          startDisabled={!!permissionError || !headphonesConfirmed}
         />
 
         <StatusIndicator status={status} errorMessage={errorMessage} />
