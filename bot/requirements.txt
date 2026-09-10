@@ -1,0 +1,17 @@
+# Bot dependencies. playwright itself is already baked into the
+# mcr.microsoft.com/playwright/python base image this Dockerfile builds
+# from (Chromium binary + its OS-level deps included) -- pinned here too
+# so `pip install -r requirements.txt` is reproducible on its own, e.g.
+# when running _verify_playwright_launch.py / _verify_audio_pipeline.py
+# directly on a dev machine outside Docker.
+playwright==1.56.0
+
+# websockets==13.1 matches backend/requirements.txt's pin. That match is
+# cosmetic, not a protocol requirement -- the ingest WebSocket is plain
+# JSON + binary frames, nothing library-specific leaks across the wire.
+# Pinned the same purely for repo consistency; don't "fix" a version
+# mismatch here later assuming it's a real compatibility issue.
+websockets==13.1
+
+pydantic-settings>=2.6.0,<3.0.0
+python-dotenv==1.0.1

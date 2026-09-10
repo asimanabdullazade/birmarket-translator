@@ -20,3 +20,25 @@ export const FALLBACK_LANGUAGES = [
   { code: "az", name: "Azerbaijani" },
   { code: "ru", name: "Russian" },
 ];
+
+// Phase 11 (meeting broadcast mode): builds the listener WebSocket URL for
+// one (meetingId, lang) room -- see backend/websocket/meeting_handlers.py's
+// /ws/meeting/{meeting_id}/listen route. Derived from BACKEND_HTTP_URL
+// (http->ws / https->wss) rather than BACKEND_WS_URL, since that constant
+// is hardcoded to the single-user app's own /ws/translate path and isn't a
+// usable base for a different route.
+export function meetingListenUrl(meetingId, lang) {
+  const wsBase = BACKEND_HTTP_URL.replace(/^http/, "ws");
+  return `${wsBase}/ws/meeting/${encodeURIComponent(meetingId)}/listen?lang=${encodeURIComponent(lang)}`;
+}
+
+// Phase 11 (meeting broadcast mode): builds the ingest WebSocket URL for a
+// meeting -- see backend/websocket/meeting_handlers.py's
+// /ws/meeting/{meeting_id}/ingest route. Used by the dev-only mic
+// broadcaster page (src/MeetingBroadcast.jsx) and matches the same wire
+// contract _dev_stream_meeting_audio.py uses. No ?lang= -- the ingest side
+// never picks a target language, see meeting_handlers.py.
+export function meetingIngestUrl(meetingId) {
+  const wsBase = BACKEND_HTTP_URL.replace(/^http/, "ws");
+  return `${wsBase}/ws/meeting/${encodeURIComponent(meetingId)}/ingest`;
+}

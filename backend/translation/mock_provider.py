@@ -16,7 +16,7 @@ import struct
 from typing import AsyncIterator, Optional
 
 from backend.audio.vad import is_speech
-from backend.translation.base import EventKind, TranslationEvent, TranslationProvider
+from backend.translation.base import EventKind, Transcription, TranslationEvent, TranslationProvider
 from backend.translation.text_chunking import split_for_speech
 
 # Sample rate for the placeholder "speech" this provider synthesizes --
@@ -46,6 +46,15 @@ class MockTranslationProvider(TranslationProvider):
         self._chunk_count = 0
         self._partial_count = 0
         self._partial_translation_count = 0
+        # Phase 11 (meeting broadcast mode): settable by test harnesses
+        # (e.g. _verify_meeting_handlers.py's CountingProvider-adjacent
+        # scenarios) to simulate a speaker in whichever language a test
+        # wants, without a constructor change. Defaults to "en" purely as
+        # a stable, predictable default -- not a claim about what a real
+        # speaker would say.
+        self._mock_detected_language = "en"
+        self._final_transcribe_count = 0
+        self._final_translate_count = 0
 
     async def start_session(self, source_lang: str, target_lang: str) -> None:
         self._source_lang = source_lang
@@ -71,6 +80,22 @@ class MockTranslationProvider(TranslationProvider):
         # streaming translation" in the README.
         self._partial_translation_count += 1
         return f"[mock translation Δ{self._partial_translation_count}] ({self._target_lang}): {new_stable_text}"
+
+    async def transcribe_final(self, pcm16_bytes: bytes) -> Optional[Transcription]:
+        # Phase 11: deliberately supported (unlike most providers) so the
+        # meeting-broadcast pipeline is fully testable with zero external
+        # dependencies -- see "Testing meeting broadcast mode" in the
+        # README. Auto-detects nothing for real; just reports whatever
+        # self._mock_detected_language is currently set to.
+        if not is_speech(pcm16_bytes):
+            return None
+        self._final_transcribe_count += 1
+        transcript_text = f"[mock final transcript #{self._final_transcribe_count}] ({self._mock_detected_language})"
+        return Transcription(text=transcript_text, detected_language=self._mock_detected_language)
+
+    async def translate_final(self, text: str, source_lang: str, target_lang: str) -> Optional[str]:
+        self._final_translate_count += 1
+        return f"[{target_lang}] {text}"
 
     async def process_audio_chunk(self, pcm16_bytes: bytes) -> list[TranslationEvent]:
         self._chunk_count += 1

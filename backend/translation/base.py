@@ -27,6 +27,17 @@ class EventKind(str, Enum):
 
 
 @dataclass
+class Transcription:
+    """Phase 11 (meeting broadcast mode): the result of a one-shot,
+    auto-detected transcription -- see TranslationProvider.transcribe_final
+    below for why this is a separate method/return type from
+    process_audio_chunk rather than reusing TranslationEvent."""
+
+    text: str
+    detected_language: Optional[str]
+
+
+@dataclass
 class TranslationEvent:
     kind: EventKind
     text: str
@@ -106,6 +117,41 @@ class TranslationProvider(ABC):
         behaves exactly as it did before Phase 8 (wait for the full
         utterance). This must stay fast/cheap-ish for the same reason
         transcribe_partial does: it can be called several times per phrase.
+        """
+        return None
+
+    async def transcribe_final(self, pcm16_bytes: bytes) -> Optional[Transcription]:
+        """
+        Phase 11 (meeting broadcast mode): one-shot transcript of a
+        *complete* utterance, auto-detecting the spoken language, with NO
+        translation. Exists so meeting_handlers.py can transcribe an
+        utterance exactly ONCE regardless of how many target languages it
+        ends up translating that transcript into (contrast
+        process_audio_chunk, which is bound to one fixed (source_lang,
+        target_lang) pair for the whole session via start_session and
+        transcribes+translates atomically -- not a fit here, since a
+        meeting's speaker language isn't known upfront and one utterance
+        may need translating into up to two different targets).
+
+        Default: unsupported (None) -- meeting mode requires this to be
+        implemented; providers that don't override it simply cannot be used
+        as a meeting ingest provider (see the provider allowlist in
+        meeting_handlers.py).
+        """
+        return None
+
+    async def translate_final(self, text: str, source_lang: str, target_lang: str) -> Optional[str]:
+        """
+        Phase 11 (meeting broadcast mode): standalone translation of
+        already-final text into an explicit target_lang -- NOT a
+        continuation (contrast translate_partial, which has no
+        source_lang/target_lang params because it continues whatever this
+        bound instance is already mid-translating for its one fixed
+        session pair). source_lang/target_lang are passed per call so one
+        provider instance can translate the same transcript into several
+        different targets in turn.
+
+        Default: unsupported (None).
         """
         return None
 

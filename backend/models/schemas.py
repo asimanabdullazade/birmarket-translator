@@ -116,6 +116,43 @@ def parse_client_message(raw: str) -> ClientMessage:
     return _client_message_adapter.validate_json(raw)
 
 
+# --- Meeting broadcast mode (Phase 11) -- ingest-side only ---
+#
+# Listeners (/ws/meeting/{id}/listen) never send control messages beyond
+# the initial HTTP-level ?lang= query param, so they need no client
+# message model. The ingest side (/ws/meeting/{id}/ingest -- a generic
+# WebSocket contract a real meeting bot, or the dev harness
+# _dev_stream_meeting_audio.py, streams audio into) needs its own "start"
+# shape: no source_lang/target_lang, since the ingest side never picks a
+# target language (see backend/websocket/meeting_handlers.py) -- kept as
+# its own small TypeAdapter, separate from `_client_message_adapter`
+# above, so the two differently-shaped "start"-typed models never collide
+# under one discriminated union.
+
+
+class MeetingIngestStartMessage(BaseModel):
+    """Sent once by whatever pushes audio into /ws/meeting/{meeting_id}/ingest
+    before streaming binary PCM16LE frames -- same wire shape as the
+    existing single-user StartMessage's audio framing, minus the language
+    fields this side never needs."""
+
+    type: Literal["start"] = "start"
+    sample_rate: int = 16000
+
+
+MeetingIngestMessage = Annotated[
+    Union[MeetingIngestStartMessage, StopMessage],
+    Field(discriminator="type"),
+]
+
+_meeting_ingest_message_adapter: TypeAdapter[MeetingIngestMessage] = TypeAdapter(MeetingIngestMessage)
+
+
+def parse_meeting_ingest_message(raw: str) -> MeetingIngestMessage:
+    """Parse a JSON text frame received on the meeting-ingest socket."""
+    return _meeting_ingest_message_adapter.validate_json(raw)
+
+
 # --- Server -> client messages ---
 
 
