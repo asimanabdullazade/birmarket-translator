@@ -1,0 +1,293 @@
+"""
+All Microsoft Teams DOM interaction lives here -- the one module in this
+bot expected to need real-world iteration against the live Teams UI.
+
+IMPORTANT CONTEXT FOR WHOEVER EDITS THIS FILE: it was written without
+ever being able to load a real Teams meeting page. The sandbox this bot
+was built in has allowlisted/proxied outbound network that already
+returned HTTP 403 for a plain request to microsoft.com, so
+teams.microsoft.com is essentially unreachable from there. Every selector
+below is a best-effort guess from public documentation/writeups about
+Teams' web-join flow (Recall.ai's public engineering writeup on building
+a Teams bot, and the general shape of Teams' web client), NOT verified
+against a live page. Expect the first real run to fail at some step --
+that's normal for this kind of DOM automation (Teams' UI is undocumented
+and changes over time/by rollout), not a defect in this initial version.
+
+Every step below screenshots via logging_utils.save_screenshot(), on
+success AND on failure -- that's the intended debugging loop: run this
+against a real meeting, look at the screenshots + logs for whichever step
+broke, fix the selector, repeat. Prefer Playwright's role/text-based
+locators (get_by_role, get_by_text, filter) over brittle CSS class
+selectors where possible -- Teams' class names are minified/generated and
+change often; visible text and ARIA roles are more likely to survive a
+UI refresh, though even these will need adjustment over time.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import re
+from urllib.parse import urlencode, urlparse, urlunparse, parse_qsl
+
+from playwright.async_api import Page, TimeoutError as PlaywrightTimeoutError
+
+from config import BotSettings
+from logging_utils import save_screenshot
+
+# --- Selectors / text patterns -------------------------------------------
+# The block most likely to need updating against a real meeting. Kept as
+# named constants, not inlined, so updates are a one-line diff per
+# element rather than a hunt through the flow functions below.
+
+# Text Teams shows on the app-launcher interstitial's "use the browser
+# instead" option. Observed phrasing has included "Continue on this
+# browser" and "Join on the web instead" in different Teams UI versions --
+# both are tried.
+_CONTINUE_ON_BROWSER_TEXTS = ["Continue on this browser", "Join on the web instead", "Use the web app instead"]
+
+# Pre-join screen: the display-name text input. Teams' web client has
+# used a placeholder like "Type your name" -- matched case-insensitively
+# and loosely since exact wording varies by locale/rollout.
+_NAME_INPUT_PLACEHOLDER_RE = re.compile(r"name", re.IGNORECASE)
+
+_JOIN_NOW_TEXTS = ["Join now", "Join"]
+
+# Lobby: Teams shows text along these lines while a guest waits to be
+# admitted.
+_LOBBY_TEXT_PATTERNS = [
+    re.compile(r"waiting for someone to let you in", re.IGNORECASE),
+    re.compile(r"someone in the meeting should let you in soon", re.IGNORECASE),
+    re.compile(r"you're in the lobby", re.IGNORECASE),
+]
+
+# In-meeting: presence of a "leave call" control is used as the positive
+# signal that admission succeeded (more reliable than trying to detect
+# the *absence* of the lobby text, which risks false-positiving on any
+# other transient screen).
+_LEAVE_CALL_TEXTS = ["Leave", "Leave call", "Hang up"]
+
+# Meeting-ended: text Teams shows after the bot leaves/is removed/the
+# meeting ends.
+_MEETING_ENDED_TEXT_PATTERNS = [
+    re.compile(r"you('| ha)ve left", re.IGNORECASE),
+    re.compile(r"the meeting has ended", re.IGNORECASE),
+    re.compile(r"call ended", re.IGNORECASE),
+]
+
+# Documented-but-brittle URL query-param trick to skip straight to the
+# browser join flow without the app-launcher interstitial appearing at
+# all. Microsoft can change/break this at any time -- it's a fallback,
+# tried only if bypass_interstitial's primary click-based approach times
+# out. See module docstring.
+_BROWSER_JOIN_PARAMS = {
+    "msLaunch": "0",
+    "type": "meetup-join",
+    "directDl": "true",
+    "enableMobilePage": "true",
+    "suppressPrompt": "true",
+}
+
+
+class JoinFailure(Exception):
+    """Raised when the bot can't get into the meeting -- interstitial, pre-join, or lobby admission failed."""
+
+
+def _with_browser_join_params(url: str) -> str:
+    parsed = urlparse(url)
+    query = dict(parse_qsl(parsed.query))
+    query.update(_BROWSER_JOIN_PARAMS)
+    return urlunparse(parsed._replace(query=urlencode(query)))
+
+
+async def launch_browser(playwright, settings: BotSettings):
+    """
+    Launch headed Chromium (NOT headless=True -- WebRTC/audio reliability
+    in true headless mode is inconsistent per every source consulted)
+    under whatever DISPLAY the entrypoint's Xvfb set up.
+
+    --use-fake-ui-for-media-stream auto-accepts the camera/mic permission
+    prompt (nobody is there to click it). --use-fake-device-for-media-
+    stream gives Chromium a fake/silent microphone -- this is the
+    code-level enforcement of "the bot never transmits real audio into
+    the meeting," not just a design note; it's not possible for this
+    process to send real mic input into Teams with this flag set.
+    """
+    browser = await playwright.chromium.launch(
+        headless=False,
+        args=[
+            "--use-fake-ui-for-media-stream",
+            "--use-fake-device-for-media-stream",
+            "--no-sandbox",  # containers commonly need this; the container itself is the sandbox boundary here
+        ],
+    )
+    context = await browser.new_context(permissions=["camera", "microphone"])
+    page = await context.new_page()
+    return browser, context, page
+
+
+async def _click_first_matching_text(page: Page, texts: list[str], timeout_ms: int) -> bool:
+    """Try clicking the first visible element matching any of `texts` (button or link role). Returns True if clicked."""
+    for text in texts:
+        for role in ("button", "link"):
+            locator = page.get_by_role(role, name=text)
+            try:
+                await locator.first.click(timeout=timeout_ms)
+                return True
+            except PlaywrightTimeoutError:
+                continue
+            except Exception:
+                continue
+    return False
+
+
+async def bypass_interstitial(page: Page, join_url: str, settings: BotSettings, logger: logging.Logger) -> None:
+    """
+    Navigate to the meeting link and land on the browser join page.
+
+    Primary path: click a "Continue on this browser"/"Join on the web
+    instead" element if Teams shows the app-launcher interstitial --
+    mirrors what a real guest does, more robust than URL trickery.
+    Fallback: re-navigate with the documented browser-join query params
+    if no such element appears within settings.join_timeout_s.
+    """
+    logger.info("navigating to meeting join URL")
+    await page.goto(join_url, timeout=int(settings.join_timeout_s * 1000))
+    await save_screenshot(page, "after-initial-navigate", settings.screenshot_dir, logger)
+
+    clicked = await _click_first_matching_text(
+        page, _CONTINUE_ON_BROWSER_TEXTS, timeout_ms=int(settings.join_timeout_s * 1000)
+    )
+    if clicked:
+        logger.info("clicked a 'continue on this browser' style element")
+        await save_screenshot(page, "after-interstitial-click", settings.screenshot_dir, logger)
+        return
+
+    logger.warning(
+        "no 'continue on this browser' element found within %.0fs -- falling back to the browser-join "
+        "URL query-param trick (documented as brittle, see browser_join.py's module docstring)",
+        settings.join_timeout_s,
+    )
+    fallback_url = _with_browser_join_params(join_url)
+    await page.goto(fallback_url, timeout=int(settings.join_timeout_s * 1000))
+    await save_screenshot(page, "after-fallback-navigate", settings.screenshot_dir, logger)
+
+
+async def complete_prejoin(page: Page, settings: BotSettings, logger: logging.Logger) -> None:
+    """Fill in the bot's display name, ensure mic/camera are off, click Join now."""
+    logger.info("filling in pre-join display name: %r", settings.bot_display_name)
+
+    name_input = page.get_by_placeholder(_NAME_INPUT_PLACEHOLDER_RE).first
+    try:
+        await name_input.fill(settings.bot_display_name, timeout=int(settings.join_timeout_s * 1000))
+    except PlaywrightTimeoutError as exc:
+        await save_screenshot(page, "prejoin-name-input-not-found", settings.screenshot_dir, logger)
+        raise JoinFailure(
+            "could not find the pre-join display-name input -- Teams' pre-join screen layout may have "
+            "changed, see the screenshot"
+        ) from exc
+
+    # Best-effort: if mic/camera toggle switches are present and appear
+    # "on", click them off. Not fatal if this can't be located -- the
+    # fake-device launch flags already prevent real audio from being
+    # captured/sent regardless, so a missed toggle is a cosmetic
+    # participant-list issue, not a privacy/correctness one.
+    for label in ("Mic", "Microphone", "Camera"):
+        toggle = page.get_by_role("button", name=re.compile(label, re.IGNORECASE))
+        try:
+            is_on = await toggle.first.get_attribute("aria-pressed", timeout=1500)
+            if is_on == "true":
+                await toggle.first.click(timeout=1500)
+                logger.info("toggled %s off on the pre-join screen", label)
+        except Exception:
+            pass  # best-effort only, see comment above
+
+    await save_screenshot(page, "prejoin-filled", settings.screenshot_dir, logger)
+
+    clicked = await _click_first_matching_text(page, _JOIN_NOW_TEXTS, timeout_ms=int(settings.join_timeout_s * 1000))
+    if not clicked:
+        await save_screenshot(page, "prejoin-join-button-not-found", settings.screenshot_dir, logger)
+        raise JoinFailure("could not find/click a 'Join now' button on the pre-join screen, see the screenshot")
+
+    logger.info("clicked join now")
+    await save_screenshot(page, "after-join-click", settings.screenshot_dir, logger)
+
+
+async def wait_for_admission(page: Page, settings: BotSettings, logger: logging.Logger) -> None:
+    """
+    Wait until the bot is actually in the meeting (a "leave call" control
+    is visible) rather than stuck in the lobby. Teams commonly holds
+    guests in a lobby until an organizer admits them -- lobby_timeout_s
+    should be generous.
+    """
+    logger.info("waiting up to %.0fs to be admitted from the lobby (if there is one)", settings.lobby_timeout_s)
+
+    lobby_detected = False
+    for pattern in _LOBBY_TEXT_PATTERNS:
+        try:
+            if await page.get_by_text(pattern).first.is_visible(timeout=2000):
+                lobby_detected = True
+                break
+        except Exception:
+            continue
+    if lobby_detected:
+        logger.info("in the lobby, waiting to be admitted")
+        await save_screenshot(page, "in-lobby", settings.screenshot_dir, logger)
+
+    deadline = asyncio.get_event_loop().time() + settings.lobby_timeout_s
+    while asyncio.get_event_loop().time() < deadline:
+        for text in _LEAVE_CALL_TEXTS:
+            locator = page.get_by_role("button", name=text)
+            try:
+                if await locator.first.is_visible(timeout=1000):
+                    logger.info("admitted to the meeting (found a %r control)", text)
+                    await save_screenshot(page, "admitted", settings.screenshot_dir, logger)
+                    return
+            except Exception:
+                continue
+        await asyncio.sleep(2.0)
+
+    await save_screenshot(page, "admission-timeout", settings.screenshot_dir, logger)
+    raise JoinFailure(
+        f"was not admitted to the meeting within {settings.lobby_timeout_s:.0f}s -- "
+        "either nobody let the bot in, or admission-detection didn't recognize the in-meeting UI, see the screenshot"
+    )
+
+
+async def watch_for_meeting_end(page: Page, settings: BotSettings, logger: logging.Logger, stop_event: asyncio.Event) -> None:
+    """
+    Poll for the meeting-ended/left screen and set stop_event when
+    detected. Requires the same state to be observed across 2 consecutive
+    polls before triggering, so a transient render doesn't cut a session
+    short. Runs until stop_event is set externally (e.g. by the ingest
+    side failing) or it detects the meeting ended itself.
+    """
+    consecutive_hits = 0
+    required_consecutive_hits = 2
+
+    while not stop_event.is_set():
+        ended = False
+        for pattern in _MEETING_ENDED_TEXT_PATTERNS:
+            try:
+                if await page.get_by_text(pattern).first.is_visible(timeout=1000):
+                    ended = True
+                    break
+            except Exception:
+                continue
+
+        if ended:
+            consecutive_hits += 1
+            logger.info("meeting-ended text detected (%d/%d consecutive checks)", consecutive_hits, required_consecutive_hits)
+            if consecutive_hits >= required_consecutive_hits:
+                logger.info("meeting ended -- triggering shutdown")
+                await save_screenshot(page, "meeting-ended", settings.screenshot_dir, logger)
+                stop_event.set()
+                return
+        else:
+            consecutive_hits = 0
+
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=settings.meeting_end_poll_interval_s)
+        except asyncio.TimeoutError:
+            continue

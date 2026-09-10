@@ -10,6 +10,11 @@ Exposes:
   GET  /health           basic liveness check
   GET  /languages         supported languages, for the frontend dropdowns
   WS   /ws/translate       the audio/translation streaming protocol
+  WS   /ws/meeting/{meeting_id}/ingest   Phase 11: meeting broadcast mode --
+                            single audio source for one meeting (a real bot
+                            or _dev_stream_meeting_audio.py)
+  WS   /ws/meeting/{meeting_id}/listen   Phase 11: one companion-page
+                            listener, subscribed to one language via ?lang=
 """
 
 from __future__ import annotations
@@ -21,6 +26,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from backend.websocket.handlers import handle_connection
 from backend.websocket.manager import ConnectionManager
+from backend.websocket.meeting_handlers import handle_meeting_ingest, handle_meeting_listener
+from backend.websocket.meeting_registry import MeetingRegistry
 from config.languages import SUPPORTED_LANGUAGES
 from config.settings import get_settings
 
@@ -39,6 +46,11 @@ app.add_middleware(
 )
 
 manager = ConnectionManager()
+# Phase 11 (meeting broadcast mode): one shared registry for the process's
+# lifetime, passed explicitly into both handlers below rather than a
+# hidden global inside meeting_registry.py -- see MeetingRegistry's
+# docstring for why (tests construct their own fresh instance).
+meeting_registry = MeetingRegistry()
 
 
 @app.get("/health")
@@ -58,3 +70,15 @@ async def ws_translate(websocket: WebSocket) -> None:
         await handle_connection(websocket, settings)
     finally:
         manager.disconnect(websocket)
+
+
+@app.websocket("/ws/meeting/{meeting_id}/ingest")
+async def ws_meeting_ingest(websocket: WebSocket, meeting_id: str) -> None:
+    await websocket.accept()
+    await handle_meeting_ingest(websocket, settings, meeting_registry, meeting_id)
+
+
+@app.websocket("/ws/meeting/{meeting_id}/listen")
+async def ws_meeting_listen(websocket: WebSocket, meeting_id: str, lang: str) -> None:
+    await websocket.accept()
+    await handle_meeting_listener(websocket, settings, meeting_registry, meeting_id, lang)

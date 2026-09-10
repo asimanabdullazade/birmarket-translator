@@ -130,6 +130,18 @@ class Settings(BaseSettings):
     # is deliberately a binary fallback, not a fine-grained diff.
     streaming_final_reconcile_min_coverage: float = 0.9
 
+    # --- Meeting broadcast mode (Phase 11) ---
+    # Fixed language set for v1 -- kept as its own explicit list (not
+    # derived from config/languages.py's SUPPORTED_LANGUAGES, even though
+    # identical today) so growing the single-user app's language list
+    # later doesn't silently change how many translate/synthesize calls
+    # meeting mode makes per utterance without a deliberate decision. See
+    # backend/websocket/meeting_handlers.py.
+    meeting_languages: list[str] = ["en", "az", "ru"]
+    # Advisory only -- logged if exceeded, never rejects a new listener.
+    # Flip to a hard cap later if a real capacity limit is ever hit.
+    meeting_max_listeners_per_meeting: int = 200
+
     # --- Logging ---
     log_level: str = "INFO"
 

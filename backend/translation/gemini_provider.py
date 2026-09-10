@@ -55,7 +55,7 @@ from typing import AsyncIterator, Optional, Type, TypeVar
 
 from pydantic import BaseModel
 
-from backend.translation.base import EventKind, TranslationEvent, TranslationProvider
+from backend.translation.base import EventKind, Transcription, TranslationEvent, TranslationProvider
 from backend.translation.text_chunking import split_for_speech
 from config.languages import SUPPORTED_LANGUAGES
 
@@ -87,6 +87,18 @@ class _PartialTranscriptionResult(BaseModel):
 
 class _PartialTranslationResult(BaseModel):
     translation: str
+
+
+class _AutoTranscriptionResult(BaseModel):
+    """Phase 11 (meeting broadcast mode): transcribe_final's result shape --
+    always auto-detects the spoken language (a meeting ingest stream has no
+    single fixed source language), and deliberately has NO translation
+    field -- unlike _TranscriptionResult above, meeting mode transcribes an
+    utterance exactly once and translates it separately, per target
+    language, via translate_final (see base.py for why)."""
+
+    transcript: str
+    detected_language: Optional[str] = None
 
 
 class GeminiTranslationProvider(TranslationProvider):
@@ -166,6 +178,24 @@ class GeminiTranslationProvider(TranslationProvider):
         result = await loop.run_in_executor(
             None, self._translate_continuation, new_stable_text, already_committed_translation
         )
+        if result is None:
+            return None
+        translation = result.translation.strip()
+        return translation or None
+
+    async def transcribe_final(self, pcm16_bytes: bytes) -> Optional[Transcription]:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, self._transcribe_auto, pcm16_bytes)
+        if result is None:
+            return None
+        transcript = result.transcript.strip()
+        if not transcript:
+            return None
+        return Transcription(text=transcript, detected_language=result.detected_language)
+
+    async def translate_final(self, text: str, source_lang: str, target_lang: str) -> Optional[str]:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, self._translate_standalone, text, source_lang, target_lang)
         if result is None:
             return None
         translation = result.translation.strip()
@@ -362,6 +392,53 @@ class GeminiTranslationProvider(TranslationProvider):
             f"best reasonable guess rather than an empty string -- a slightly rough "
             f"partial is fine here, since the final authoritative translation is "
             f"computed separately once the whole sentence is done."
+        )
+        return self._call_gemini(prompt, _PartialTranslationResult)
+
+    def _transcribe_auto(self, pcm16_bytes: bytes) -> Optional[_AutoTranscriptionResult]:
+        """Phase 11: one-shot transcript of a complete meeting utterance,
+        always auto-detecting the spoken language (unlike
+        _transcribe_and_translate, which only auto-detects when
+        self._source_lang == "auto" -- meeting mode has no bound source
+        language at all, see start_session's placeholder pair in
+        meeting_handlers.py). No translation is requested here -- that's
+        translate_final's job, called separately per target language."""
+        prompt = (
+            "First identify the spoken language in the attached audio. Then "
+            "transcribe exactly what is said, in that same language.\n\n"
+            "Report the spoken language you detected as an ISO 639-1 two-letter "
+            "code (e.g. 'en', 'az', 'ru') in detected_language, or null if you "
+            "can't tell. If the audio has no discernible speech (silence, noise, "
+            "just breathing), return an empty string for transcript."
+        )
+        return self._call_gemini(prompt, _AutoTranscriptionResult, pcm16_bytes=pcm16_bytes)
+
+    def _translate_standalone(
+        self, text: str, source_lang: str, target_lang: str
+    ) -> Optional[_PartialTranslationResult]:
+        """Phase 11: one-shot, non-continuation translation of an already-
+        final transcript into an explicit target_lang -- text-only, via the
+        same _call_gemini(pcm16_bytes=None) path _translate_continuation
+        already exercises (built for Phase 8). Unlike
+        _translate_continuation, there's no "already committed" prefix to
+        avoid repeating -- this is the whole utterance, translated once."""
+        source_name = _LANGUAGE_NAMES.get(source_lang, source_lang)
+        target_name = _LANGUAGE_NAMES.get(target_lang, target_lang)
+        prompt = (
+            f"Translate the following {source_name} text into {target_name}.\n\n"
+            f"Text to translate: \"{text}\"\n\n"
+            f"Translate the way a skilled human interpreter would in a live business "
+            f"meeting, not the way a document translator would: natural, idiomatic, "
+            f"spoken {target_name}, phrased the way a native {target_name} speaker "
+            f"would actually say it out loud in conversation. Prefer the most natural "
+            f"spoken phrasing over a literal, word-for-word rendering of the source "
+            f"sentence structure -- reorder words, drop filler, or rephrase as needed "
+            f"for that, the way an interpreter does, as long as the meaning stays the "
+            f"same. Avoid stiff, overly formal, or bookish wording.\n\n"
+            f"Keep numbers, dates, times, personal names, and company/product names "
+            f"exactly as they refer to -- never translate, guess at, or alter what "
+            f"they mean (only reformat them into {target_name}'s normal written "
+            f"convention if that differs, e.g. date order or a decimal separator)."
         )
         return self._call_gemini(prompt, _PartialTranslationResult)
 

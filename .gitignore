@@ -29,3 +29,11 @@ debug_audio/
 
 # Debug audio dumps (DEBUG_AUDIO_DUMP_DIR)
 debug_audio/
+
+# Teams bot run artifacts (SCREENSHOT_DIR)
+bot/screenshots/
+
+# Local file backups from patching
+*.bak
+*.prev
+*.r[0-9]

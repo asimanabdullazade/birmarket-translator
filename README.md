@@ -87,6 +87,13 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r backend/requirements.txt
 cp config/.env.example config/.env   # optional, defaults already work
 uvicorn backend.main:app --reload --port 8000
+
+
+`--reload` binds to `127.0.0.1` and only watches `.py` files. Both are
+fine for browser-based use, but if you are running the Teams bot
+(`bot/`), it needs `--host 0.0.0.0` to be reachable from the container,
+and a full restart (not a reload) to pick up `config/.env` changes, since
+`get_settings()` is `@lru_cache`d. See `bot/README.md`.
 ```
 
 ### Frontend
