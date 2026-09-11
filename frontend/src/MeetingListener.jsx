@@ -52,12 +52,25 @@ export default function MeetingListener() {
   // Phase 13: null until the Teams probe settles, so the layout doesn't
   // flash full-width before collapsing into the panel.
   const [teamsState, setTeamsState] = useState(null);
+  // Translation playback volume, 0..1. The ORIGINAL meeting audio is not
+  // ours to control -- it is the Teams client playing through the
+  // person's speakers, and this page is an iframe beside it with no
+  // access to that stream. So this slider governs the translated voice
+  // only, and the UI says so rather than implying a balance control it
+  // cannot deliver.
+  const [volume, setVolumeState] = useState(1);
+  const [muted, setMutedState] = useState(false);
 
   const playerRef = useRef(null);
   const socketRef = useRef(null);
   const reconnectTimeoutRef = useRef(null);
   const joinedRef = useRef(false);
   const captionsRef = useRef(null);
+  // Every caption for this session, uncapped. `captions` state is
+  // deliberately trimmed to the last 50 so the DOM stays small, but a
+  // transcript that silently dropped everything before the last 50 lines
+  // would be worse than no transcript at all.
+  const historyRef = useRef([]);
 
   useEffect(() => {
     // Resolves either way and never throws -- see teams/teamsPanel.js.
@@ -90,9 +103,25 @@ export default function MeetingListener() {
     };
   }, []);
 
+  function setVolume(next) {
+    setVolumeState(next);
+    playerRef.current?.setVolume(next);
+  }
+
+  function toggleMuted() {
+    const next = !muted;
+    setMutedState(next);
+    playerRef.current?.setMuted(next);
+  }
+
   function connect() {
     if (!playerRef.current) {
       playerRef.current = new TranslationAudioPlayer();
+      // The player is created on first join, after the user may already
+      // have moved the slider -- carry the current settings over rather
+      // than silently resetting them to full volume.
+      playerRef.current.setVolume(volume);
+      playerRef.current.setMuted(muted);
     }
     // Reuses the "reconnecting" status/style for the initial connection
     // attempt too -- both are "trying to connect," and it saves adding a
@@ -110,6 +139,16 @@ export default function MeetingListener() {
       } catch {
         return;
       }
+      if (msg.type === "transcript" || msg.type === "translation") {
+        historyRef.current.push({
+          timestamp: msg.timestamp,
+          speaker: msg.speaker || null,
+          kind: msg.type,
+          text: msg.text,
+          lang: msg.type === "translation" ? msg.target_lang : msg.detected_language || null,
+        });
+      }
+
       if (msg.type === "status") {
         setStatus(msg.status === "listening" ? "listening" : msg.status);
       } else if (msg.type === "transcript") {
@@ -149,7 +188,49 @@ export default function MeetingListener() {
     joinedRef.current = true;
     setJoined(true);
     setCaptions([]);
+    historyRef.current = [];
     connect();
+  }
+
+  function downloadTranscript() {
+    const entries = historyRef.current;
+    if (entries.length === 0) return;
+
+    const header = [
+      `Meeting: ${meetingId}`,
+      `Listening in: ${lang}`,
+      `Exported: ${new Date().toISOString()}`,
+      `Lines: ${entries.length}`,
+      "",
+      "".padEnd(60, "-"),
+      "",
+    ];
+
+    const body = entries.map((entry) => {
+      // Times are ISO-8601 UTC on the wire; show local clock time, which
+      // is what someone reading the transcript afterwards actually wants.
+      let clock = "";
+      try {
+        clock = new Date(entry.timestamp).toLocaleTimeString();
+      } catch {
+        clock = entry.timestamp || "";
+      }
+      const who = entry.speaker ? ` ${entry.speaker}` : "";
+      const tag = entry.kind === "translation" ? `[${entry.lang || "translation"}]` : "[original]";
+      return `${clock}${who} ${tag}\n${entry.text}\n`;
+    });
+
+    const blob = new Blob([header.concat(body).join("\n")], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = `transcript-${meetingId}-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.txt`;
+    document.body.appendChild(anchor);
+    anchor.click();
+    document.body.removeChild(anchor);
+    // Revoke on the next tick -- revoking synchronously can cancel the
+    // download in some browsers before it has started reading the blob.
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
 
   function leave() {
@@ -215,7 +296,36 @@ export default function MeetingListener() {
 
             {errorMessage && <p className="status-error-detail">{errorMessage}</p>}
 
+            <div className="field volume-field">
+              <span className="field-label">
+                Translation volume{muted ? " (muted)" : ` (${Math.round(volume * 100)}%)`}
+              </span>
+              <input
+                type="range"
+                min="0"
+                max="100"
+                value={Math.round(volume * 100)}
+                disabled={muted}
+                onChange={(event) => setVolume(Number(event.target.value) / 100)}
+              />
+            </div>
+
+            <p className="volume-hint">
+              This controls the translated voice only. To hear more or less of the original
+              speakers, use Teams&apos; own volume.
+            </p>
+
             <div className="controls">
+              <button className="btn btn-secondary" onClick={toggleMuted}>
+                {muted ? "Unmute translation" : "Mute translation"}
+              </button>
+              <button
+                className="btn btn-secondary"
+                onClick={downloadTranscript}
+                disabled={captions.length === 0}
+              >
+                Download transcript
+              </button>
               <button className="btn btn-stop" onClick={leave}>
                 Leave
               </button>

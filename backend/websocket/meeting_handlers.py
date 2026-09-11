@@ -52,9 +52,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import math
+import array
 import logging
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 from fastapi import WebSocket, WebSocketDisconnect
@@ -73,7 +76,7 @@ from backend.models.schemas import (
     parse_meeting_ingest_message,
 )
 from backend.translation.base import TranslationProvider
-from backend.translation.factory import get_provider
+from backend.translation.factory import get_provider, is_live_provider
 from backend.websocket.handlers import _pcm16_to_wav_bytes, _safe_send
 from backend.websocket.meeting_registry import MeetingRegistry
 from config.languages import is_supported
@@ -96,6 +99,41 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _rms_int16(pcm16: bytes) -> int:
+    """RMS level of a PCM16LE buffer, in raw int16 units (0..32767)."""
+    if not pcm16:
+        return 0
+    samples = array.array("h")
+    samples.frombytes(pcm16[: len(pcm16) - (len(pcm16) % 2)])
+    if not samples:
+        return 0
+    return int(math.sqrt(sum(s * s for s in samples) / len(samples)))
+
+
+def _dump_utterance_audio(settings: Settings, meeting_id: str, audio: bytes, logger: logging.Logger) -> None:
+    """
+    Write each segmented utterance to a WAV when debug_audio_dump_dir is
+    set, so the exact audio the model was given can be listened to.
+
+    This already existed for the single-user path (handlers.py) but not
+    for meeting ingest, which is where it is most needed: with a bot in
+    the room nobody ever hears what the pipeline actually captured, so a
+    hallucinated transcript is impossible to tell apart from a genuine
+    mis-hearing without this. Never raises -- debugging aids must not take
+    a meeting down.
+    """
+    if not settings.debug_audio_dump_dir:
+        return
+    try:
+        directory = Path(settings.debug_audio_dump_dir) / f"meeting_{meeting_id}"
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"utt_{datetime.now():%Y%m%d_%H%M%S_%f}.wav"
+        path.write_bytes(_pcm16_to_wav_bytes(audio, settings.audio_sample_rate))
+        logger.debug("Meeting %s: dumped utterance audio to %s", meeting_id, path)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Meeting %s: failed to dump utterance audio: %s", meeting_id, exc)
+
+
 async def _process_utterance(
     provider: TranslationProvider,
     settings: Settings,
@@ -105,9 +143,20 @@ async def _process_utterance(
     speaker: Optional[str] = None,
 ) -> None:
     started_at = time.perf_counter()
+
+    # Level of the audio actually handed to the model. Logged on every
+    # utterance because a speech model given noise does not fail loudly --
+    # it invents fluent, plausible sentences. When transcripts start
+    # reading like someone else's conversation, the question is always
+    # "was this really speech?", and rms is the cheapest answer.
+    utterance_rms = _rms_int16(audio)
+    _dump_utterance_audio(settings, meeting_id, audio, logger)
+
     transcription = await provider.transcribe_final(audio)
     transcribe_s = time.perf_counter() - started_at
     if transcription is None or not transcription.text:
+        logger.debug("Meeting %s: empty transcript for a %.1fs utterance (rms=%d)",
+                     meeting_id, len(audio) / 2 / 16000, utterance_rms)
         return
 
     detected_lang = transcription.detected_language
@@ -121,6 +170,15 @@ async def _process_utterance(
             transcription.text[:120],
         )
         return
+
+    logger.info(
+        "Meeting %s: [%s] rms=%d %.1fs -> %r",
+        meeting_id,
+        detected_lang,
+        utterance_rms,
+        len(audio) / 2 / 16000,
+        transcription.text[:160],
+    )
 
     timestamp = _now_iso()
 
@@ -230,12 +288,24 @@ async def handle_meeting_ingest(
     websocket: WebSocket, settings: Settings, registry: MeetingRegistry, meeting_id: str
 ) -> None:
     provider_name = settings.translation_provider.lower()
+
+    # Phase 15: gemini_live takes a different path entirely -- one live
+    # session per listener language, no VAD segmentation on our side. Same
+    # wire protocol, so the bot and _dev_stream_meeting_audio.py are
+    # unchanged. Dispatched here rather than in main.py so both meeting
+    # modes stay behind one endpoint.
+    if is_live_provider(provider_name):
+        from backend.websocket.live_meeting_handlers import handle_meeting_ingest_live
+
+        await handle_meeting_ingest_live(websocket, settings, registry, meeting_id)
+        return
+
     if provider_name not in _MEETING_INGEST_PROVIDERS:
         await _safe_send(
             websocket,
             ErrorMessage(
                 message=(
-                    f"Meeting broadcast mode requires TRANSLATION_PROVIDER to be one of "
+                    f"Meeting broadcast mode requires TRANSLATION_PROVIDER to be gemini_live or one of "
                     f"{sorted(_MEETING_INGEST_PROVIDERS)} (got '{settings.translation_provider}') -- "
                     "see transcribe_final/translate_final in backend/translation/base.py."
                 )
