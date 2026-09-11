@@ -30,8 +30,8 @@ export default defineConfig({
     // HTTPS, which in dev means an ngrok tunnel. Those requests arrive
     // with a Host header Vite doesn't recognise, and Vite (5.4.12+)
     // answers "Blocked request. This host is not allowed." rather than
-    // serving the app. Note ngrok now issues .ngrok-free.dev hostnames;
-    // the older .app/.io suffixes are kept for existing tunnels.
+    // serving the app. Allowing the tunnel domains fixes that. Harmless
+    // for local use, so it is not gated behind viaTunnel.
     allowedHosts: [".ngrok-free.dev", ".ngrok-free.app", ".ngrok.app", ".ngrok.io"],
     // Through a tunnel, HMR's own WebSocket must go back out over
     // 443/wss rather than to localhost:5173, or the dev client can never
@@ -64,6 +64,10 @@ export default defineConfig({
         main: fileURLToPath(new URL("./index.html", import.meta.url)),
         listener: fileURLToPath(new URL("./listener.html", import.meta.url)),
         broadcast: fileURLToPath(new URL("./broadcast.html", import.meta.url)),
+        // Phase 13: the Teams tab-configuration page (manifest
+        // configurationUrl). Served automatically by `npm run dev`, but
+        // `vite build` needs it named explicitly like the others.
+        configure: fileURLToPath(new URL("./configure.html", import.meta.url)),
       },
     },
   },

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { TranslationAudioPlayer } from "./audio/audioPlayback.js";
 import { BACKEND_HTTP_URL, FALLBACK_LANGUAGES, meetingListenUrl } from "./config.js";
+import { initTeamsPanel, isSidePanel } from "./teams/teamsPanel.js";
 
 /**
  * Phase 11 (meeting broadcast mode): the companion page one meeting
@@ -21,6 +22,16 @@ import { BACKEND_HTTP_URL, FALLBACK_LANGUAGES, meetingListenUrl } from "./config
  * Reconnect here is a simple fixed delay, not useWebSocket.js's fuller
  * exponential-backoff logic -- there's no mic/session state to preserve
  * on this page, just "keep trying to be connected while joined."
+ *
+ * Phase 13 (Teams meeting side panel): this same component also renders
+ * inside Teams, in a 320px-wide in-meeting side panel. Nothing about the
+ * connection, protocol or playback changes -- Teams just loads this page
+ * in an iframe. The only differences are cosmetic (a `teams-panel` class
+ * that reflows for a narrow column and drops the page heading, which the
+ * panel's own header already provides) plus the required TeamsJS
+ * handshake in teams/teamsPanel.js. In a plain browser tab the Teams
+ * probe fails silently and everything behaves exactly as in Phase 11,
+ * which matters because the plain tab is how this page is developed.
  */
 
 const RECONNECT_DELAY_MS = 2000;
@@ -38,12 +49,20 @@ export default function MeetingListener() {
   const [status, setStatus] = useState("idle"); // idle | connecting | listening | reconnecting | error
   const [errorMessage, setErrorMessage] = useState("");
   const [captions, setCaptions] = useState([]); // {key, kind: "transcript"|"translation", text}
+  // Phase 13: null until the Teams probe settles, so the layout doesn't
+  // flash full-width before collapsing into the panel.
+  const [teamsState, setTeamsState] = useState(null);
 
   const playerRef = useRef(null);
   const socketRef = useRef(null);
   const reconnectTimeoutRef = useRef(null);
   const joinedRef = useRef(false);
   const captionsRef = useRef(null);
+
+  useEffect(() => {
+    // Resolves either way and never throws -- see teams/teamsPanel.js.
+    initTeamsPanel().then(setTeamsState);
+  }, []);
 
   useEffect(() => {
     fetch(`${BACKEND_HTTP_URL}/languages`)
@@ -136,22 +155,31 @@ export default function MeetingListener() {
     playerRef.current?.stop();
   }
 
+  const inPanel = isSidePanel(teamsState);
+
   return (
-    <div className="app">
-      <h1>Live Meeting Translation</h1>
+    <div className={inPanel ? "app teams-panel" : "app"}>
+      {/* The Teams side panel draws its own header with the tab name, so a
+          second in-page title just eats vertical space in a 320px column. */}
+      {!inPanel && <h1>Live Meeting Translation</h1>}
 
       <div className="panel">
         {!joined && (
           <>
-            <div className="field">
-              <span className="field-label">Meeting ID</span>
-              <input
-                type="text"
-                value={meetingId}
-                onChange={(event) => setMeetingId(event.target.value)}
-                placeholder="e.g. weekly-standup"
-              />
-            </div>
+            {/* Inside Teams the meeting_id is fixed by the manifest's
+                contentUrl (see src/teamsConfig.js), so showing an editable
+                field would just invite someone to break their own panel. */}
+            {!inPanel && (
+              <div className="field">
+                <span className="field-label">Meeting ID</span>
+                <input
+                  type="text"
+                  value={meetingId}
+                  onChange={(event) => setMeetingId(event.target.value)}
+                  placeholder="e.g. weekly-standup"
+                />
+              </div>
+            )}
 
             <div className="field">
               <span className="field-label">I want to hear:</span>

@@ -1,0 +1,34 @@
+{
+  "$schema": "https://developer.microsoft.com/en-us/json-schemas/teams/v1.17/MicrosoftTeams.schema.json",
+  "manifestVersion": "1.17",
+  "version": "1.0.0",
+  "id": "8b559b0e-43b1-426e-be9e-6275fb9968a5",
+  "developer": {
+    "name": "Birmarket",
+    "websiteUrl": "https://starboard-amusing-geologic.ngrok-free.dev",
+    "privacyUrl": "https://starboard-amusing-geologic.ngrok-free.dev",
+    "termsOfUseUrl": "https://starboard-amusing-geologic.ngrok-free.dev"
+  },
+  "name": {
+    "short": "Live Translation",
+    "full": "Live Meeting Translation"
+  },
+  "description": {
+    "short": "Live translated captions in your own language.",
+    "full": "Shows live captions of the meeting translated into the language you choose, in a side panel next to the meeting."
+  },
+  "icons": {
+    "color": "color.png",
+    "outline": "outline.png"
+  },
+  "accentColor": "#4F52B2",
+  "configurableTabs": [
+    {
+      "configurationUrl": "https://starboard-amusing-geologic.ngrok-free.dev/configure.html",
+      "canUpdateConfiguration": true,
+      "scopes": ["groupchat"],
+      "context": ["meetingSidePanel", "meetingChatTab"]
+    }
+  ],
+  "validDomains": ["starboard-amusing-geologic.ngrok-free.dev"]
+}

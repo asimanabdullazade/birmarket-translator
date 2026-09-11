@@ -342,3 +342,92 @@ select {
     opacity: 0;
   }
 }
+
+/* ---------------------------------------------------------------------
+   Phase 13: Teams meeting side panel.
+
+   The panel is a fixed 320px-wide iframe inside the Teams client, so the
+   listener page has to work in roughly a third of the width it was
+   designed for. These rules only apply when MeetingListener detects
+   frameContext === "sidePanel"; a plain browser tab is untouched.
+
+   The approach is to strip chrome rather than shrink it: no page title
+   (Teams draws its own tab header), no max-width centring, minimal
+   padding, and the caption list taking all remaining height. In a column
+   this narrow, captions are the only thing worth showing.
+   --------------------------------------------------------------------- */
+
+.teams-panel {
+  max-width: none;
+  width: 100%;
+  margin: 0;
+  padding: 8px;
+  box-sizing: border-box;
+  /* Fill the iframe so the caption list can own the leftover space. */
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.teams-panel .panel {
+  padding: 8px;
+  margin: 0;
+  border-radius: 6px;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0; /* lets the caption list scroll instead of overflowing */
+}
+
+/* Stack labels above controls -- side-by-side rows wrap badly at 320px. */
+.teams-panel .field {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
+  margin-bottom: 8px;
+}
+
+.teams-panel .field-label {
+  font-size: 12px;
+}
+
+.teams-panel select,
+.teams-panel input[type="text"] {
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.teams-panel .controls {
+  margin: 0 0 8px;
+}
+
+.teams-panel .controls .btn {
+  width: 100%;
+}
+
+.teams-panel .status-row {
+  margin-bottom: 6px;
+  font-size: 12px;
+}
+
+.teams-panel .transcript-panel {
+  flex: 1;
+  min-height: 0;
+  max-height: none;
+  overflow-y: auto;
+  font-size: 13px;
+  line-height: 1.45;
+  padding: 6px;
+}
+
+.teams-panel .transcript-entry {
+  margin-bottom: 6px;
+}
+
+/* Teams' own dark theme sits behind this iframe; without a background the
+   panel would show the host theme through the page's transparent areas. */
+.teams-panel,
+.teams-panel .panel {
+  background: #fff;
+}
