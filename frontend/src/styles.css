@@ -447,3 +447,32 @@ select {
 .teams-panel .caption-speaker {
   font-size: 10px;
 }
+
+/* Phase 15: translation playback controls in the listener/panel. */
+.volume-field input[type="range"] {
+  width: 100%;
+}
+
+.volume-hint {
+  margin: 0 0 10px;
+  font-size: 11px;
+  line-height: 1.4;
+  opacity: 0.6;
+}
+
+.btn-secondary {
+  background: #5b5fc7;
+  color: #fff;
+}
+
+/* In the 320px panel the two buttons stack rather than sitting side by
+   side -- at that width they would each be too narrow to read. */
+.teams-panel .controls {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.teams-panel .volume-hint {
+  font-size: 10px;
+}
