@@ -113,9 +113,15 @@ export default function MeetingListener() {
       if (msg.type === "status") {
         setStatus(msg.status === "listening" ? "listening" : msg.status);
       } else if (msg.type === "transcript") {
-        setCaptions((prev) => [...prev.slice(-49), { key: `${msg.timestamp}-t`, kind: "transcript", text: msg.text }]);
+        setCaptions((prev) => [
+          ...prev.slice(-49),
+          { key: `${msg.timestamp}-t`, kind: "transcript", text: msg.text, speaker: msg.speaker || null },
+        ]);
       } else if (msg.type === "translation") {
-        setCaptions((prev) => [...prev.slice(-49), { key: `${msg.timestamp}-x`, kind: "translation", text: msg.text }]);
+        setCaptions((prev) => [
+          ...prev.slice(-49),
+          { key: `${msg.timestamp}-x`, kind: "translation", text: msg.text, speaker: msg.speaker || null },
+        ]);
       } else if (msg.type === "audio") {
         playerRef.current.enqueue(msg.audio_base64);
       } else if (msg.type === "error") {
@@ -219,6 +225,11 @@ export default function MeetingListener() {
               {captions.length === 0 && <p className="transcript-empty">Captions will appear here once someone speaks.</p>}
               {captions.map((caption) => (
                 <div className="transcript-entry" key={caption.key}>
+                  {/* Phase 14: attribution is best-effort (see
+                      bot/speaker_tracker.js) -- when the bot can't tell who
+                      spoke, the caption renders exactly as it did before
+                      rather than showing a placeholder name. */}
+                  {caption.speaker && <div className="caption-speaker">{caption.speaker}</div>}
                   <div className={caption.kind === "translation" ? "translation-line" : "transcript-line"}>
                     {caption.text}
                   </div>

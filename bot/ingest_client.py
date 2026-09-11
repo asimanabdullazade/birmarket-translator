@@ -33,6 +33,7 @@ async def stream_to_ingest(
     frame_source: AsyncIterator[bytes],
     stop_event: asyncio.Event,
     logger: logging.Logger,
+    speaker_tracker=None,
 ) -> None:
     """
     Connect to the meeting's ingest WebSocket, send `start`, forward every
@@ -56,6 +57,13 @@ async def stream_to_ingest(
             sent_bytes = 0
             frame_iter = frame_source.__aiter__()
 
+            # Phase 14: the active speaker is sticky state, not a stream,
+            # so rather than racing a third future in the select loop
+            # below, changes piggyback on the next audio frame. Frames
+            # arrive several times a second, so the added latency is
+            # smaller than the Teams indicator's own lag.
+            last_speaker_sent = object()  # sentinel: never equal to a real value
+
             while not stop_event.is_set():
                 next_frame_task = asyncio.ensure_future(frame_iter.__anext__())
                 stop_wait_task = asyncio.ensure_future(stop_event.wait())
@@ -71,6 +79,12 @@ async def stream_to_ingest(
                     except StopAsyncIteration:
                         logger.info("audio frame source exhausted")
                         break
+                    if speaker_tracker is not None:
+                        speaker = speaker_tracker.current
+                        if speaker != last_speaker_sent:
+                            last_speaker_sent = speaker
+                            await ws.send(json.dumps({"type": "speaker", "name": speaker}))
+
                     await ws.send(chunk)
                     sent_bytes += len(chunk)
                 else:

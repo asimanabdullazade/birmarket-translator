@@ -53,6 +53,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -63,6 +64,7 @@ from backend.audio.segmenter import SegmenterEventKind, SpeechSegmenter
 from backend.models.schemas import (
     AudioMessage,
     ErrorMessage,
+    MeetingIngestSpeakerMessage,
     MeetingIngestStartMessage,
     StatusMessage,
     StopMessage,
@@ -100,17 +102,23 @@ async def _process_utterance(
     registry: MeetingRegistry,
     meeting_id: str,
     audio: bytes,
+    speaker: Optional[str] = None,
 ) -> None:
+    started_at = time.perf_counter()
     transcription = await provider.transcribe_final(audio)
+    transcribe_s = time.perf_counter() - started_at
     if transcription is None or not transcription.text:
         return
 
     detected_lang = transcription.detected_language
     if detected_lang not in settings.meeting_languages:
         logger.warning(
-            "Meeting %s: dropping an utterance in unrecognized/undetected language %r",
+            "Meeting %s: dropping an utterance in unrecognized/undetected language %r "
+            "(configured: %s). Transcript was: %r",
             meeting_id,
             detected_lang,
+            ",".join(settings.meeting_languages),
+            transcription.text[:120],
         )
         return
 
@@ -127,15 +135,48 @@ async def _process_utterance(
             is_final=True,
             timestamp=timestamp,
             detected_language=detected_lang,
+            speaker=speaker,
         ).model_dump_json(),
     )
 
+    # Phase 14 latency work. Two structural problems were fixed here.
+    #
+    # 1. SEQUENTIAL TARGETS. The original loop did, per target language in
+    #    turn: translate, then stream the whole TTS, then move to the next
+    #    language. So with en/az/ru, a Russian listener waited for the
+    #    entire Azerbaijani translation AND its speech synthesis before
+    #    their own translation was even requested. Latency grew linearly
+    #    with the number of languages, and the last one always lost.
+    #    Languages are independent, so they now run concurrently.
+    #
+    # 2. TRANSLATING FOR NOBODY. Every configured language was translated
+    #    and synthesized whether or not a single listener was in that
+    #    room. That is wasted latency for the people who ARE listening
+    #    (they queue behind those calls) and wasted spend. Phase 11's
+    #    premise was "provider cost flat in listeners" -- this makes it
+    #    flat in *languages actually being listened to*.
+    targets = []
+    skipped = []
     for target_lang in settings.meeting_languages:
         if target_lang == detected_lang:
             continue
+        if registry.listener_count(meeting_id, target_lang) > 0:
+            targets.append(target_lang)
+        else:
+            skipped.append(target_lang)
+
+    if skipped:
+        logger.debug("Meeting %s: no listeners for %s -- not translating", meeting_id, ",".join(skipped))
+
+    async def _translate_and_speak(target_lang: str) -> tuple[str, float, float]:
+        t_start = time.perf_counter()
         translated = await provider.translate_final(transcription.text, detected_lang, target_lang)
+        translate_s = time.perf_counter() - t_start
         if not translated:
-            continue
+            return target_lang, translate_s, 0.0
+
+        # Text first, audio after: reading the translation is useful
+        # immediately, and TTS is much slower than translation.
         await registry.broadcast(
             meeting_id,
             target_lang,
@@ -145,8 +186,11 @@ async def _process_utterance(
                 source_lang=detected_lang,
                 target_lang=target_lang,
                 timestamp=timestamp,
+                speaker=speaker,
             ).model_dump_json(),
         )
+
+        tts_start = time.perf_counter()
         async for pcm_chunk, sample_rate in provider.synthesize_speech(translated):
             if not pcm_chunk:
                 continue
@@ -159,6 +203,27 @@ async def _process_utterance(
                     timestamp=timestamp,
                 ).model_dump_json(),
             )
+        return target_lang, translate_s, time.perf_counter() - tts_start
+
+    results = await asyncio.gather(*(_translate_and_speak(t) for t in targets), return_exceptions=True)
+
+    # Timing breakdown, so latency is diagnosed from numbers rather than
+    # impressions. transcribe is one shared call; the rest run in parallel,
+    # so the wall clock is roughly transcribe + the slowest language.
+    parts = []
+    for item in results:
+        if isinstance(item, BaseException):
+            logger.warning("Meeting %s: a target language failed: %s", meeting_id, item)
+            continue
+        lang, translate_s, tts_s = item
+        parts.append(f"{lang}: translate {translate_s:.2f}s + tts {tts_s:.2f}s")
+    logger.info(
+        "Meeting %s: utterance done in %.2fs (transcribe %.2fs%s)",
+        meeting_id,
+        time.perf_counter() - started_at,
+        transcribe_s,
+        ("; " + "; ".join(parts)) if parts else "",
+    )
 
 
 async def handle_meeting_ingest(
@@ -196,13 +261,24 @@ async def handle_meeting_ingest(
     queue: "asyncio.Queue" = asyncio.Queue()
     consumer_task: Optional[asyncio.Task] = None
 
+    # Phase 14 speaker attribution. `current_speaker` is whatever the bot
+    # last reported; `utterance_speaker` is that value snapshotted at
+    # SPEECH_START. The snapshot matters: an utterance is only segmented
+    # after the trailing silence, by which point the Teams roster has
+    # frequently already moved on to whoever spoke next, so reading the
+    # live value at UTTERANCE_READY attributes lines to the wrong person
+    # exactly when conversation is quickest.
+    current_speaker: Optional[str] = None
+    utterance_speaker: Optional[str] = None
+
     async def consume() -> None:
         while True:
             item = await queue.get()
             if item is _STOP:
                 return
+            audio, speaker = item
             try:
-                await _process_utterance(provider, settings, registry, meeting_id, item)
+                await _process_utterance(provider, settings, registry, meeting_id, audio, speaker)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -267,11 +343,15 @@ async def handle_meeting_ingest(
                     logger.info("Meeting %s: ingest started", meeting_id)
                     await _safe_send(websocket, StatusMessage(status="listening").model_dump_json())
 
+                elif isinstance(parsed, MeetingIngestSpeakerMessage):
+                    current_speaker = parsed.name
+                    logger.debug("Meeting %s: active speaker is now %r", meeting_id, current_speaker)
+
                 elif isinstance(parsed, StopMessage):
                     if session_active and segmenter is not None and provider is not None:
                         remainder = segmenter.flush()
                         if remainder:
-                            queue.put_nowait(remainder)
+                            queue.put_nowait((remainder, utterance_speaker))
                         await drain_consumer()
                         await provider.close_session()
                     session_active = False
@@ -287,11 +367,13 @@ async def handle_meeting_ingest(
 
                 data = message["bytes"]
                 for event in segmenter.push(data):
-                    if event.kind == SegmenterEventKind.UTTERANCE_READY:
-                        queue.put_nowait(event.audio)
-                    # SPEECH_START / PARTIAL_UPDATE are deliberately
-                    # ignored here -- v1 sends no interim captions in
-                    # meeting mode (see the Phase 11 plan).
+                    if event.kind == SegmenterEventKind.SPEECH_START:
+                        # Snapshot who was talking as this utterance began.
+                        utterance_speaker = current_speaker
+                    elif event.kind == SegmenterEventKind.UTTERANCE_READY:
+                        queue.put_nowait((event.audio, utterance_speaker))
+                    # PARTIAL_UPDATE is deliberately ignored -- v1 sends no
+                    # interim captions in meeting mode (Phase 11 plan).
 
     except WebSocketDisconnect:
         logger.info("Meeting %s: ingest connection disconnected", meeting_id)

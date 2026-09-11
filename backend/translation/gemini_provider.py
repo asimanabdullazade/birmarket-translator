@@ -58,6 +58,7 @@ from pydantic import BaseModel
 from backend.translation.base import EventKind, Transcription, TranslationEvent, TranslationProvider
 from backend.translation.text_chunking import split_for_speech
 from config.languages import SUPPORTED_LANGUAGES
+from config.settings import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -403,13 +404,29 @@ class GeminiTranslationProvider(TranslationProvider):
         language at all, see start_session's placeholder pair in
         meeting_handlers.py). No translation is requested here -- that's
         translate_final's job, called separately per target language."""
+        # The allowed set is CLOSED, not exemplary. The original prompt
+        # said "e.g. 'en', 'az', 'ru'", which invites the whole ISO 639-1
+        # list -- and on a short or noisy utterance Gemini duly returned
+        # things like 'fr' and 'ko'. meeting_handlers drops any language
+        # outside settings.meeting_languages, so each of those hallucinated
+        # codes silently threw away a real sentence somebody had spoken.
+        # Constraining the choice is much more effective here than widening
+        # the accepted set downstream would be.
+        allowed = list(get_settings().meeting_languages)
+        allowed_str = ", ".join(f"'{code}'" for code in allowed)
+
         prompt = (
             "First identify the spoken language in the attached audio. Then "
             "transcribe exactly what is said, in that same language.\n\n"
-            "Report the spoken language you detected as an ISO 639-1 two-letter "
-            "code (e.g. 'en', 'az', 'ru') in detected_language, or null if you "
-            "can't tell. If the audio has no discernible speech (silence, noise, "
-            "just breathing), return an empty string for transcript."
+            f"The speaker is using one of these languages: {allowed_str}. "
+            "Report which one in detected_language, using exactly that "
+            "two-letter code and nothing else. Never report any other "
+            "language code. If the audio is too short, too noisy or too "
+            "unclear to choose between them, pick the one it most resembles "
+            "rather than guessing at a language outside this list.\n\n"
+            "Only if there is no discernible speech at all (silence, background "
+            "noise, breathing) return an empty string for transcript and null "
+            "for detected_language."
         )
         return self._call_gemini(prompt, _AutoTranscriptionResult, pcm16_bytes=pcm16_bytes)
 
