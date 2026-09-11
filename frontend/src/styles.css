@@ -431,3 +431,19 @@ select {
 .teams-panel .panel {
   background: #fff;
 }
+
+/* Phase 14: speaker attribution above each caption. Small and muted --
+   the caption is the content, the name is a label for it. Absent
+   entirely when the bot couldn't tell who was talking. */
+.caption-speaker {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  opacity: 0.6;
+  margin-bottom: 2px;
+}
+
+.teams-panel .caption-speaker {
+  font-size: 10px;
+}

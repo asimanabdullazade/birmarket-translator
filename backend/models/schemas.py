@@ -130,6 +130,22 @@ def parse_client_message(raw: str) -> ClientMessage:
 # under one discriminated union.
 
 
+class MeetingIngestSpeakerMessage(BaseModel):
+    """Phase 14: who is currently talking, as observed by the bot.
+
+    Sent on the ingest socket whenever the active speaker CHANGES, not per
+    frame -- the bot reads it from the Teams roster (see
+    bot/speaker_tracker.py) and the value is sticky between changes.
+
+    `name` is None when nobody is speaking or the bot can't tell. That is
+    an expected state, not an error: attribution is best-effort, and the
+    pipeline works exactly as before without it.
+    """
+
+    type: Literal["speaker"] = "speaker"
+    name: Optional[str] = None
+
+
 class MeetingIngestStartMessage(BaseModel):
     """Sent once by whatever pushes audio into /ws/meeting/{meeting_id}/ingest
     before streaming binary PCM16LE frames -- same wire shape as the
@@ -141,7 +157,7 @@ class MeetingIngestStartMessage(BaseModel):
 
 
 MeetingIngestMessage = Annotated[
-    Union[MeetingIngestStartMessage, StopMessage],
+    Union[MeetingIngestStartMessage, StopMessage, MeetingIngestSpeakerMessage],
     Field(discriminator="type"),
 ]
 
@@ -174,6 +190,11 @@ class TranscriptMessage(BaseModel):
     type: Literal["transcript"] = "transcript"
     text: str
     is_final: bool
+    # Phase 14: best-effort speaker attribution, None when unknown.
+    # Snapshotted when the utterance STARTED, not when it finished --
+    # by the time an utterance is segmented the roster has often already
+    # moved on to the next talker.
+    speaker: Optional[str] = None
     # ISO-8601 UTC timestamp of when the *phrase* started (not when this
     # message was sent) -- shared by every partial and the final message
     # for the same phrase, so a client can group them and/or show when the
@@ -198,6 +219,11 @@ class TranslationMessage(BaseModel):
     renders a growing partial transcript (overwrite in place)."""
 
     type: Literal["translation"] = "translation"
+    # Phase 14: best-effort speaker attribution, None when unknown.
+    # Snapshotted when the utterance STARTED, not when it finished --
+    # by the time an utterance is segmented the roster has often already
+    # moved on to the next talker.
+    speaker: Optional[str] = None
     text: str
     is_final: bool
     source_lang: str

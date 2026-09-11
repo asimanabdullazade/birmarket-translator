@@ -20,6 +20,7 @@ from playwright.async_api import async_playwright
 import audio_pipeline
 import browser_join
 import ingest_client
+import speaker_tracker as speaker_tracker_mod
 from config import BotSettings, get_bot_settings
 from logging_utils import configure_logging, save_screenshot
 
@@ -57,8 +58,17 @@ async def run(settings: BotSettings) -> int:
             ffmpeg_proc = await audio_pipeline.start_ffmpeg_capture(settings, logger)
             frame_source = audio_pipeline.capture_frames(ffmpeg_proc, settings, logger)
 
+            # Phase 14: best-effort speaker attribution. Optional by
+            # design -- if this task dies or matches nothing, captions
+            # simply arrive unattributed and everything else is unaffected.
+            tracker = speaker_tracker_mod.SpeakerTracker(page, settings, logger)
+            speaker_task = asyncio.create_task(
+                tracker.run(stop_event),
+                name="speaker_tracker",
+            )
+
             ingest_task = asyncio.create_task(
-                ingest_client.stream_to_ingest(settings, frame_source, stop_event, logger),
+                ingest_client.stream_to_ingest(settings, frame_source, stop_event, logger, tracker),
                 name="ingest",
             )
             end_watch_task = asyncio.create_task(
@@ -79,7 +89,11 @@ async def run(settings: BotSettings) -> int:
 
                 stop_event.set()
 
-                for task in pending:
+                # speaker_task is deliberately NOT in the FIRST_COMPLETED
+                # set above -- attribution ending must never bring the
+                # session down -- but it still has to be drained here, or
+                # it is left pending when the loop closes.
+                for task in list(pending) + [speaker_task]:
                     try:
                         await asyncio.wait_for(task, timeout=10.0)
                     except asyncio.TimeoutError:
