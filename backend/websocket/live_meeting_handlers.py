@@ -71,6 +71,7 @@ from backend.models.schemas import (
     ErrorMessage,
     MeetingIngestSpeakerMessage,
     MeetingIngestStartMessage,
+    OriginalAudioMessage,
     StatusMessage,
     StopMessage,
     TranscriptMessage,
@@ -340,6 +341,7 @@ class _MeetingLiveSession:
                                             ).decode("ascii"),
                                             sample_rate=_OUTPUT_SAMPLE_RATE,
                                             timestamp=phrase.started_at,
+                                            speaker=phrase.speaker,
                                         ).model_dump_json(),
                                     )
 
@@ -616,6 +618,22 @@ async def handle_meeting_ingest_live(
                     )
                     continue
                 await pool.feed(message["bytes"], sample_rate)
+
+                # Relay the untranslated audio to every listener room so
+                # clients can mix original against translation. Off by
+                # default: it roughly doubles per-listener bandwidth and
+                # is only useful to someone who has muted Teams.
+                if settings.relay_original_audio:
+                    payload = OriginalAudioMessage(
+                        audio_base64=base64.b64encode(
+                            _pcm16_to_wav_bytes(message["bytes"], sample_rate)
+                        ).decode("ascii"),
+                        sample_rate=sample_rate,
+                        timestamp=_now_iso(),
+                    ).model_dump_json()
+                    for lang in settings.meeting_languages:
+                        if registry.listener_count(meeting_id, lang) > 0:
+                            await registry.broadcast(meeting_id, lang, payload)
 
     except WebSocketDisconnect:
         logger.info("Meeting %s: live ingest connection disconnected", meeting_id)

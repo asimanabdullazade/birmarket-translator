@@ -36,6 +36,27 @@ import { initTeamsPanel, isSidePanel } from "./teams/teamsPanel.js";
 
 const RECONNECT_DELAY_MS = 2000;
 
+/**
+ * Compare a roster name against the viewer's own name.
+ *
+ * These do not arrive identically: the Teams roster shows guests as
+ * "Melek Askerova (Unverified)" while app.getContext() returns
+ * "Melek Askerova", and spacing/casing vary. Exact equality would
+ * therefore almost never match for exactly the people most likely to be
+ * bothered by hearing themselves.
+ */
+function isSamePerson(a, b) {
+  if (!a || !b) return false;
+  const normalize = (value) =>
+    value
+      .toLowerCase()
+      .replace(/\(unverified\)/g, "")
+      .replace(/[^\p{L}\p{N} ]/gu, "")
+      .replace(/\s+/g, " ")
+      .trim();
+  return normalize(a) === normalize(b);
+}
+
 function getMeetingIdFromUrl() {
   const params = new URLSearchParams(window.location.search);
   return params.get("meeting_id") || params.get("meetingId") || "";
@@ -60,8 +81,37 @@ export default function MeetingListener() {
   // cannot deliver.
   const [volume, setVolumeState] = useState(1);
   const [muted, setMutedState] = useState(false);
+  // Original (untranslated) meeting audio, relayed by the backend when
+  // RELAY_ORIGINAL_AUDIO is on. Defaults to 0 -- silent unless asked for.
+  // Anything above 0 is only sensible once Teams itself is muted: our
+  // copy of the meeting arrives about a second later, so both at once is
+  // the same voices heard twice, offset.
+  const [originalVolume, setOriginalVolumeState] = useState(0);
+  const [originalAvailable, setOriginalAvailable] = useState(false);
+  // Lower the original automatically while a translation is speaking.
+  // Two voices at constant volume compete for attention -- which is the
+  // actual reason hearing both is hard to follow, more than the levels
+  // themselves. This is how interpretation feeds have always worked.
+  const [duckOriginal, setDuckOriginal] = useState(true);
+  // The viewer's own name, and whether to suppress their own speech.
+  // Hearing a translation of the sentence you are still finishing is
+  // disorienting, so this defaults ON.
+  const [myName, setMyName] = useState("");
+  const [skipOwnSpeech, setSkipOwnSpeech] = useState(true);
 
   const playerRef = useRef(null);
+  // A second, independent player so the two streams have separate gain.
+  const originalPlayerRef = useRef(null);
+  // socket.onmessage is installed once per connect, so it closes over the
+  // state values from THAT render. Reading originalVolume directly there
+  // would freeze it at its initial 0 and the slider would appear to do
+  // nothing. A ref is always current.
+  const originalVolumeRef = useRef(0);
+  // Same stale-closure reason as originalVolumeRef: read inside onmessage.
+  const duckOriginalRef = useRef(true);
+  // Read inside onmessage, which closes over the render at connect time.
+  const myNameRef = useRef("");
+  const skipOwnSpeechRef = useRef(true);
   const socketRef = useRef(null);
   const reconnectTimeoutRef = useRef(null);
   const joinedRef = useRef(false);
@@ -74,7 +124,13 @@ export default function MeetingListener() {
 
   useEffect(() => {
     // Resolves either way and never throws -- see teams/teamsPanel.js.
-    initTeamsPanel().then(setTeamsState);
+    initTeamsPanel().then((state) => {
+      setTeamsState(state);
+      if (state?.displayName) {
+        setMyName(state.displayName);
+        myNameRef.current = state.displayName;
+      }
+    });
   }, []);
 
   useEffect(() => {
@@ -100,8 +156,15 @@ export default function MeetingListener() {
       if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
       socketRef.current?.close();
       playerRef.current?.stop();
+      originalPlayerRef.current?.stop();
     };
   }, []);
+
+  function setOriginalVolume(next) {
+    setOriginalVolumeState(next);
+    originalVolumeRef.current = next;
+    originalPlayerRef.current?.setVolume(next);
+  }
 
   function setVolume(next) {
     setVolumeState(next);
@@ -123,6 +186,10 @@ export default function MeetingListener() {
       playerRef.current.setVolume(volume);
       playerRef.current.setMuted(muted);
     }
+    if (!originalPlayerRef.current) {
+      originalPlayerRef.current = new TranslationAudioPlayer();
+      originalPlayerRef.current.setVolume(originalVolume);
+    }
     // Reuses the "reconnecting" status/style for the initial connection
     // attempt too -- both are "trying to connect," and it saves adding a
     // separate "connecting" CSS class that would look identical anyway.
@@ -139,6 +206,18 @@ export default function MeetingListener() {
       } catch {
         return;
       }
+      // Suppress everything attributed to the viewer. Done here, before
+      // captions, history and playback, so their own speech is absent
+      // from all three rather than merely inaudible.
+      if (
+        skipOwnSpeechRef.current &&
+        msg.speaker &&
+        myNameRef.current &&
+        isSamePerson(msg.speaker, myNameRef.current)
+      ) {
+        return;
+      }
+
       if (msg.type === "transcript" || msg.type === "translation") {
         historyRef.current.push({
           timestamp: msg.timestamp,
@@ -163,6 +242,22 @@ export default function MeetingListener() {
         ]);
       } else if (msg.type === "audio") {
         playerRef.current.enqueue(msg.audio_base64);
+        // Duck the original for as long as this translation will play.
+        // getPlaybackEndsAt() already accounts for anything still queued
+        // ahead of this chunk, so back-to-back chunks extend the duck
+        // rather than each scheduling its own release.
+        if (duckOriginalRef.current && originalVolumeRef.current > 0) {
+          originalPlayerRef.current?.duckUntil(playerRef.current.getPlaybackEndsAt(), 0.15);
+        }
+      } else if (msg.type === "original_audio") {
+        // Safe to call unconditionally: React bails out when the value is
+        // unchanged, and the `originalAvailable` read here would be stale.
+        setOriginalAvailable(true);
+        // Don't even decode while silent -- at ~5 chunks/second this is
+        // pure waste for the default case where nobody wants it.
+        if (originalVolumeRef.current > 0) {
+          originalPlayerRef.current?.enqueue(msg.audio_base64);
+        }
       } else if (msg.type === "error") {
         setErrorMessage(msg.message);
       }
@@ -240,6 +335,7 @@ export default function MeetingListener() {
     if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
     socketRef.current?.close();
     playerRef.current?.stop();
+    originalPlayerRef.current?.stop();
   }
 
   const inPanel = isSidePanel(teamsState);
@@ -296,6 +392,30 @@ export default function MeetingListener() {
 
             {errorMessage && <p className="status-error-detail">{errorMessage}</p>}
 
+            <div className="field">
+              <span className="field-label">My name in this meeting</span>
+              <input
+                type="text"
+                value={myName}
+                placeholder="e.g. Asiman Abdullazada"
+                onChange={(event) => {
+                  setMyName(event.target.value);
+                  myNameRef.current = event.target.value;
+                }}
+              />
+              <label className="duck-toggle">
+                <input
+                  type="checkbox"
+                  checked={skipOwnSpeech}
+                  onChange={(event) => {
+                    setSkipOwnSpeech(event.target.checked);
+                    skipOwnSpeechRef.current = event.target.checked;
+                  }}
+                />
+                Don&apos;t show or play my own speech
+              </label>
+            </div>
+
             <div className="field volume-field">
               <span className="field-label">
                 Translation volume{muted ? " (muted)" : ` (${Math.round(volume * 100)}%)`}
@@ -310,9 +430,36 @@ export default function MeetingListener() {
               />
             </div>
 
+            {originalAvailable && (
+              <div className="field volume-field">
+                <span className="field-label">
+                  Original meeting volume ({Math.round(originalVolume * 100)}%)
+                </span>
+                <input
+                  type="range"
+                  min="0"
+                  max="100"
+                  value={Math.round(originalVolume * 100)}
+                  onChange={(event) => setOriginalVolume(Number(event.target.value) / 100)}
+                />
+                <label className="duck-toggle">
+                  <input
+                    type="checkbox"
+                    checked={duckOriginal}
+                    onChange={(event) => {
+                      setDuckOriginal(event.target.checked);
+                      duckOriginalRef.current = event.target.checked;
+                    }}
+                  />
+                  Lower the original while the translation speaks
+                </label>
+              </div>
+            )}
+
             <p className="volume-hint">
-              This controls the translated voice only. To hear more or less of the original
-              speakers, use Teams&apos; own volume.
+              {originalAvailable
+                ? "Mute Teams before raising the original volume -- this copy arrives about a second later, so you would otherwise hear everyone twice."
+                : "This controls the translated voice only. To hear more or less of the original speakers, use Teams' own volume."}
             </p>
 
             <div className="controls">

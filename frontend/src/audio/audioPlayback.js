@@ -41,13 +41,59 @@ export class TranslationAudioPlayer {
     // getPlaybackEndsAt(). Same wall-clock-via-AudioContext-delay trick
     // enqueue()'s own return value already uses for Step 7.
     this._playbackEndsAt = 0;
+    // Phase 16 (ducking): a multiplier applied on top of `volume`, used
+    // to lower THIS player while another one is talking. Kept separate
+    // from `volume` so the user's own setting is never overwritten by an
+    // automatic adjustment -- restoring it afterwards just means setting
+    // the factor back to 1.
+    this._duckFactor = 1;
+    this._duckTimer = null;
+  }
+
+  /**
+   * Ramp gain to `volume * factor` now, and back to full shortly after
+   * `untilMs` (a Date.now()-style timestamp).
+   *
+   * Ramped rather than stepped: an abrupt gain change on speech is
+   * audible as a click, and the point of this feature is to make two
+   * simultaneous voices comfortable rather than to add a new artifact.
+   * The fade back up is slower than the fade down, which is what makes
+   * it feel like someone lowering a radio rather than a gate opening.
+   */
+  duckUntil(untilMs, factor = 0.2) {
+    this._duckFactor = factor;
+    this._applyGain(0.08);
+
+    if (this._duckTimer) clearTimeout(this._duckTimer);
+    // A short tail past the end: translations often arrive as several
+    // back-to-back chunks, and coming back to full between them would
+    // pump the original up and down mid-sentence.
+    const delay = Math.max(0, untilMs - Date.now()) + 250;
+    this._duckTimer = setTimeout(() => {
+      this._duckTimer = null;
+      this._duckFactor = 1;
+      this._applyGain(0.35);
+    }, delay);
+  }
+
+  _applyGain(rampSeconds = 0) {
+    if (!this.gainNode || !this.audioContext) return;
+    const target = this.muted ? 0 : this.volume * this._duckFactor;
+    const now = this.audioContext.currentTime;
+    this.gainNode.gain.cancelScheduledValues(now);
+    this.gainNode.gain.setValueAtTime(this.gainNode.gain.value, now);
+    if (rampSeconds > 0) {
+      this.gainNode.gain.linearRampToValueAtTime(target, now + rampSeconds);
+    } else {
+      this.gainNode.gain.setValueAtTime(target, now);
+    }
   }
 
   _ensureContext() {
     if (!this.audioContext) {
       this.audioContext = new AudioContext();
       this.gainNode = this.audioContext.createGain();
-      this.gainNode.gain.value = this.muted ? 0 : this.volume;
+      this.gainNode.gain.value = this.muted ? 0 : this.volume * this._duckFactor;
       this.gainNode.connect(this.audioContext.destination);
       this.nextStartTime = 0;
     }
@@ -57,14 +103,14 @@ export class TranslationAudioPlayer {
   setVolume(volume) {
     this.volume = volume;
     if (this.gainNode && !this.muted) {
-      this.gainNode.gain.value = volume;
+      this._applyGain();
     }
   }
 
   setMuted(muted) {
     this.muted = muted;
     if (this.gainNode) {
-      this.gainNode.gain.value = muted ? 0 : this.volume;
+      this._applyGain();
     }
   }
 
@@ -150,6 +196,14 @@ export class TranslationAudioPlayer {
 
   /** Stop everything scheduled/playing and reset the queue (e.g. on Stop). */
   stop() {
+    if (this._duckTimer) {
+      clearTimeout(this._duckTimer);
+      this._duckTimer = null;
+    }
+    // Duck state IS reset here, unlike volume/muted below: it is a
+    // transient reaction to audio that is no longer playing, not a
+    // preference. Leaving it set would start the next session quiet.
+    this._duckFactor = 1;
     this.audioContext?.close();
     this.audioContext = null;
     this.gainNode = null;
