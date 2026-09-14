@@ -170,6 +170,43 @@ class Settings(BaseSettings):
     # gemini-3.5-transcribe-live is a dedicated speech-recognition
     # pipeline rather than a conversational agent, and unlike the
     # translate model it documents language_codes biasing.
+    # Phase 18: derive translations from the TRANSCRIPT rather than
+    # letting the speech-to-speech sessions do their own recognition.
+    #
+    # Previously the same audio went to two independent models and each
+    # recognised it separately, so the transcript on screen and the
+    # translation in your ear came from two different hearings of one
+    # sentence. They disagreed -- and in a real meeting the transcriber
+    # got Azerbaijani right while the translate model rendered it as
+    # unrelated English. They also could not be paired in the UI, since
+    # each had its own phrase boundaries, so captions interleaved into
+    # something unreadable.
+    #
+    # One recognition, everything derived from it. The cost is latency:
+    # translate and synthesize are now separate calls after each phrase
+    # rather than audio streaming straight out of the translate model.
+    # Set false to go back to speech-to-speech.
+    # Phase 18 latency work.
+    #
+    # Firing every phrase's synthesis concurrently and unbounded made
+    # individual TTS calls occasionally take 17-34s -- the model queueing
+    # or rate-limiting us, not the model being slow. A small bound keeps
+    # calls fast rather than letting them pile up.
+    tts_max_concurrency: int = 2
+
+    # Discard translated speech that is already this far behind the
+    # moment it was spoken.
+    #
+    # Late audio is not merely useless, it is harmful: the client plays
+    # buffers back to back, so a chunk arriving 30s late also delays
+    # everything queued behind it, and the lag compounds instead of
+    # recovering. Dropping it lets playback catch up. The caption text is
+    # unaffected -- it is broadcast before synthesis starts, so a reader
+    # still sees the phrase.
+    tts_deadline_s: float = 10.0
+
+    translate_from_transcript: bool = True
+
     use_dedicated_transcription: bool = True
     gemini_transcribe_model: str = "gemini-3.5-transcribe-live"
 

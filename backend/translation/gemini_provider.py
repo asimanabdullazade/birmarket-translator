@@ -203,9 +203,41 @@ class GeminiTranslationProvider(TranslationProvider):
         return translation or None
 
     async def synthesize_speech(self, text: str) -> AsyncIterator[tuple[bytes, int]]:
+        """
+        Synthesize every speakable chunk CONCURRENTLY, yielding them in
+        order.
+
+        This used to await each chunk before starting the next, which made
+        synthesis cost roughly (number of chunks x per-call latency). In a
+        real meeting that showed up as wild variance -- a short phrase took
+        2.3s while a long one took 27.1s, for the same model. It looked
+        like a slow model; it was actually the same slow call repeated
+        five times in series.
+
+        The chunks are independent, so they are all submitted at once and
+        then awaited in order. Order matters -- these are consecutive
+        pieces of one sentence and the client plays them back to back --
+        but waiting for chunk 1 before REQUESTING chunk 2 never did.
+        Time-to-first-audio improves too: chunk 1 is no longer queued
+        behind anything.
+        """
         loop = asyncio.get_event_loop()
-        for chunk in split_for_speech(text):
-            pcm = await loop.run_in_executor(None, self._synthesize_chunk, chunk)
+        chunks = list(split_for_speech(text))
+        if not chunks:
+            return
+
+        # Submitted eagerly -- run_in_executor schedules immediately rather
+        # than on await, which is what makes these overlap.
+        pending = [loop.run_in_executor(None, self._synthesize_chunk, chunk) for chunk in chunks]
+
+        for future in pending:
+            try:
+                pcm = await future
+            except Exception:  # noqa: BLE001
+                # One chunk failing should cost that chunk, not the rest of
+                # the sentence.
+                logger.exception("Gemini speech synthesis failed for one chunk")
+                continue
             if pcm:
                 yield pcm, _TTS_SAMPLE_RATE
 
