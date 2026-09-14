@@ -115,6 +115,12 @@ class _Phrase:
 
     started_at: str = field(default_factory=_now_iso)
     speaker: Optional[str] = None
+    # BCP-47 code reported by the transcription model, when it gives one.
+    language: Optional[str] = None
+    # Monotonic time of the phrase's first recognised text, for latency
+    # reporting. Not the same as `started_at`, which is a wall-clock
+    # timestamp used to tag messages.
+    first_text_at: float = 0.0
     input_text: str = ""
     output_text: str = ""
     last_input_activity: float = field(default_factory=lambda: asyncio.get_event_loop().time())
@@ -501,15 +507,23 @@ class _TranscriptionSession:
         registry: MeetingRegistry,
         meeting_id: str,
         speaker_provider: Callable[[], Optional[str]],
+        text_provider=None,
     ) -> None:
         self._settings = settings
         self._registry = registry
         self._meeting_id = meeting_id
         self._speaker_provider = speaker_provider
+        # Translates the recognised text and speaks it. Present when this
+        # session is the single source (see module docstring); None when
+        # the translate sessions still own translation.
+        self._text_provider = text_provider
         self._session: Optional[object] = None
         self._stop = False
         self._phrase = _Phrase()
         self._lock = asyncio.Lock()
+        # Bounds how many speech-synthesis calls are in flight at once.
+        # See tts_max_concurrency in config/settings.py.
+        self._tts_slots = asyncio.Semaphore(max(1, settings.tts_max_concurrency))
 
     async def feed(self, pcm16: bytes, sample_rate: int) -> None:
         session = self._session
@@ -526,6 +540,132 @@ class _TranscriptionSession:
 
     def request_stop(self) -> None:
         self._stop = True
+
+    async def _fan_out(
+        self,
+        text: str,
+        source_lang: Optional[str],
+        speaker: Optional[str],
+        timestamp: str,
+        first_text_at: float = 0.0,
+    ) -> None:
+        """Translate the recognised text into every listened language and
+        speak it.
+
+        This is the whole point of routing translation through the
+        transcript: previously the translate sessions did their OWN
+        recognition of the same audio, so the transcript on screen and the
+        translation in your ear came from two different hearings of the
+        same sentence. They disagreed, and only one of them was reliable.
+        Now there is a single recognition, and everything downstream is
+        derived from it.
+        """
+        source = (source_lang or "auto").split("-")[0]
+        targets = [
+            lang
+            for lang in self._settings.meeting_languages
+            if lang != source and self._registry.listener_count(self._meeting_id, lang) > 0
+        ]
+        if not targets:
+            return
+
+        loop = asyncio.get_event_loop()
+        fan_out_at = loop.time()
+
+        async def one(target_lang: str) -> tuple:
+            started = loop.time()
+            try:
+                translated = await self._text_provider.translate_final(text, source, target_lang)
+            except Exception:  # noqa: BLE001
+                logger.exception("Meeting %s: translation into %s failed", self._meeting_id, target_lang)
+                return (target_lang, 0.0, 0.0)
+            translate_s = loop.time() - started
+            if not translated:
+                return (target_lang, translate_s, 0.0)
+
+            # Text first: reading it is useful immediately, and speech
+            # synthesis is much slower than translation.
+            await self._registry.broadcast(
+                self._meeting_id,
+                target_lang,
+                TranslationMessage(
+                    text=translated,
+                    is_final=True,
+                    source_lang=source,
+                    target_lang=target_lang,
+                    timestamp=timestamp,
+                    speaker=speaker,
+                ).model_dump_json(),
+            )
+
+            text_at = loop.time()
+            deadline = self._settings.tts_deadline_s
+
+            # Already too late to be worth speaking? Skip synthesis
+            # entirely rather than paying for audio nobody can use.
+            if first_text_at and (loop.time() - first_text_at) > deadline:
+                logger.info(
+                    "Meeting %s: skipping speech for %s -- phrase is already %.1fs old",
+                    self._meeting_id,
+                    target_lang,
+                    loop.time() - first_text_at,
+                )
+                return (target_lang, translate_s, 0.0)
+
+            try:
+                async with self._tts_slots:
+                    async for pcm_chunk, sample_rate in self._text_provider.synthesize_speech(translated):
+                        if not pcm_chunk:
+                            continue
+                        # Re-check per chunk: synthesis can stall midway,
+                        # and playing the tail of a phrase whose head was
+                        # dropped is worse than silence.
+                        if first_text_at and (loop.time() - first_text_at) > deadline:
+                            logger.info(
+                                "Meeting %s: dropping the rest of %s speech -- %.1fs behind",
+                                self._meeting_id,
+                                target_lang,
+                                loop.time() - first_text_at,
+                            )
+                            break
+                        await self._registry.broadcast(
+                            self._meeting_id,
+                            target_lang,
+                            AudioMessage(
+                                audio_base64=base64.b64encode(
+                                    _pcm16_to_wav_bytes(pcm_chunk, sample_rate)
+                                ).decode("ascii"),
+                                sample_rate=sample_rate,
+                                timestamp=timestamp,
+                                speaker=speaker,
+                            ).model_dump_json(),
+                        )
+            except Exception:  # noqa: BLE001
+                logger.exception("Meeting %s: speech for %s failed", self._meeting_id, target_lang)
+            return (target_lang, translate_s, loop.time() - text_at)
+
+        # Languages are independent; running them in series would make the
+        # last listener wait for every other language first.
+        results = await asyncio.gather(*(one(t) for t in targets), return_exceptions=True)
+
+        # Report the whole speech-to-listener delay, broken down. Latency
+        # here is a stack of separate costs -- waiting for the speaker to
+        # pause, translating, synthesizing -- and they need very different
+        # fixes, so an overall "it feels slow" is not actionable.
+        parts = [
+            f"{lang} translate {t:.2f}s + tts {v:.2f}s"
+            for item in results
+            if not isinstance(item, BaseException)
+            for lang, t, v in [item]
+        ]
+        wait_for_pause_s = (fan_out_at - first_text_at) if first_text_at else 0.0
+        logger.info(
+            "Meeting %s: phrase to listener in %.2fs (waited %.2fs for a pause%s)",
+            self._meeting_id,
+            loop.time() - first_text_at if first_text_at else 0.0,
+            wait_for_pause_s,
+            ("; " + "; ".join(parts)) if parts else "",
+        )
 
     async def run(self) -> None:
         from google import genai
@@ -574,12 +714,22 @@ class _TranscriptionSession:
                 for lang in self._settings.meeting_languages:
                     await self._registry.broadcast(self._meeting_id, lang, payload)
                 logger.info(
-                    "Meeting %s [transcribe]: %s speaker=%r %r",
+                    "Meeting %s [transcribe]: %s speaker=%r [%s] %r",
                     self._meeting_id,
                     reason,
                     phrase.speaker,
+                    phrase.language or "auto",
                     text[:100],
                 )
+
+                if self._text_provider is not None:
+                    # Fire and forget: translation must not block the next
+                    # phrase's recognition.
+                    asyncio.create_task(
+                        self._fan_out(
+                            text, phrase.language, phrase.speaker, phrase.started_at, phrase.first_text_at
+                        )
+                    )
             self._phrase = _Phrase(speaker=self._speaker_provider())
 
         async def locked_finalize(reason: str) -> None:
@@ -625,8 +775,17 @@ class _TranscriptionSession:
                                 phrase = self._phrase
                                 if not phrase.input_text:
                                     phrase.speaker = self._speaker_provider()
+                                    phrase.first_text_at = loop.time()
                                 phrase.input_text += text
                                 phrase.last_input_activity = loop.time()
+                                # The transcription model reports which
+                                # language it recognised; without it we
+                                # would have to guess the source again,
+                                # reintroducing the detection problem this
+                                # whole path exists to avoid.
+                                detected = getattr(content.input_transcription, "language_code", None)
+                                if detected:
+                                    phrase.language = detected
                             if content.input_transcription.finished:
                                 await locked_finalize("finished")
 
@@ -676,6 +835,7 @@ class _SessionPool:
         self._tasks: Dict[str, asyncio.Task] = {}
         self._transcriber: Optional[_TranscriptionSession] = None
         self._transcriber_task: Optional[asyncio.Task] = None
+        self._text_provider = None
 
     def _wanted_languages(self) -> list[str]:
         return [
@@ -683,6 +843,18 @@ class _SessionPool:
             for lang in self._settings.meeting_languages
             if self._registry.listener_count(self._meeting_id, lang) > 0
         ]
+
+    def _wanted_translate_sessions(self) -> set:
+        """Which speech-to-speech sessions to run.
+
+        None of them when translating from the transcript: their own
+        recognition is exactly the second, worse hearing this mode exists
+        to remove. The transcriber still needs to know a language is
+        wanted, which _wanted_languages above answers.
+        """
+        if self._settings.translate_from_transcript:
+            return set()
+        return set(self._wanted_languages())
 
     async def reconcile(self) -> None:
         wanted = set(self._wanted_languages())
@@ -693,15 +865,38 @@ class _SessionPool:
         # precisely the weak transcript this replaces, and listeners
         # would get both.
         if wanted and self._settings.use_dedicated_transcription and self._transcriber is None:
+            if self._settings.translate_from_transcript and self._text_provider is None:
+                from backend.translation.gemini_provider import GeminiTranslationProvider
+
+                # Constructed directly rather than via get_provider():
+                # translation_provider is "gemini_live" in this mode, and
+                # the factory rightly refuses to hand back a live provider
+                # for text calls. What is wanted here is specifically the
+                # request/response Gemini provider for translate_final and
+                # synthesize_speech.
+                self._text_provider = GeminiTranslationProvider(
+                    api_key=self._settings.gemini_api_key,
+                    model=self._settings.gemini_model,
+                    sample_rate=self._settings.audio_sample_rate,
+                    tts_model=self._settings.gemini_tts_model,
+                    tts_voice=self._settings.gemini_tts_voice,
+                )
+
             self._transcriber = _TranscriptionSession(
-                self._settings, self._registry, self._meeting_id, self._speaker_provider
+                self._settings,
+                self._registry,
+                self._meeting_id,
+                self._speaker_provider,
+                text_provider=self._text_provider,
             )
             self._transcriber_task = asyncio.create_task(
                 self._transcriber.run(), name=f"transcribe-{self._meeting_id}"
             )
             logger.info("Meeting %s: opening dedicated transcription session", self._meeting_id)
 
-        for lang in wanted - current:
+        translate_wanted = self._wanted_translate_sessions()
+
+        for lang in translate_wanted - current:
             is_primary = (
                 not self._settings.use_dedicated_transcription
                 and not any(s.is_primary for s in self._sessions.values())
@@ -713,8 +908,8 @@ class _SessionPool:
             self._tasks[lang] = asyncio.create_task(session.run(), name=f"live-{self._meeting_id}-{lang}")
             logger.info("Meeting %s: opening live session for %r (primary=%s)", self._meeting_id, lang, is_primary)
 
-        for lang in current - wanted:
-            logger.info("Meeting %s: no listeners left for %r -- closing its session", self._meeting_id, lang)
+        for lang in current - translate_wanted:
+            logger.info("Meeting %s: closing the speech-to-speech session for %r", self._meeting_id, lang)
             await self._close(lang)
 
         # If the primary went away, promote another so transcripts keep

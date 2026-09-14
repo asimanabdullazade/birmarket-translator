@@ -111,6 +111,11 @@ export default function MeetingListener() {
   const duckOriginalRef = useRef(true);
   // Read inside onmessage, which closes over the render at connect time.
   const myNameRef = useRef("");
+  // connect() runs from the reconnect timer as well as directly, and the
+  // closure's `lang` is whatever it was at that render. A ref is the one
+  // that is current -- without it, switching language then losing the
+  // connection would silently reconnect to the OLD room.
+  const langRef = useRef("en"); // kept in step with the lang state below
   const skipOwnSpeechRef = useRef(true);
   const socketRef = useRef(null);
   const reconnectTimeoutRef = useRef(null);
@@ -196,7 +201,7 @@ export default function MeetingListener() {
     setStatus("reconnecting");
     setErrorMessage("");
 
-    const socket = new WebSocket(meetingListenUrl(meetingId, lang));
+    const socket = new WebSocket(meetingListenUrl(meetingId, langRef.current));
     socketRef.current = socket;
 
     socket.onmessage = (event) => {
@@ -273,6 +278,33 @@ export default function MeetingListener() {
       // onclose fires right after and decides reconnect vs. not -- avoid
       // duplicating that decision here.
     };
+  }
+
+  function switchLanguage(next) {
+    setLang(next);
+    langRef.current = next;
+    if (!joinedRef.current) return; // pre-join: just a selection
+
+    // Rejoin the new language's room. The room is bound at connect time
+    // by the ?lang= query parameter, so there is no "change language"
+    // message to send -- reconnecting IS the switch.
+    if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
+
+    const socket = socketRef.current;
+    if (socket) {
+      // Detach onclose first: this close is deliberate, and the handler
+      // would otherwise schedule a reconnect that races the one below.
+      socket.onclose = null;
+      socket.close();
+    }
+
+    // Drop speech already queued in the previous language -- otherwise
+    // the old language keeps talking for a few seconds after the switch,
+    // which reads as the control not having worked.
+    playerRef.current?.stop();
+
+    setStatus("reconnecting");
+    connect();
   }
 
   function join() {
@@ -366,7 +398,7 @@ export default function MeetingListener() {
 
             <div className="field">
               <span className="field-label">I want to hear:</span>
-              <select value={lang} onChange={(event) => setLang(event.target.value)}>
+              <select value={lang} onChange={(event) => switchLanguage(event.target.value)}>
                 {languages.map((language) => (
                   <option key={language.code} value={language.code}>
                     {language.name}
@@ -391,6 +423,17 @@ export default function MeetingListener() {
             </div>
 
             {errorMessage && <p className="status-error-detail">{errorMessage}</p>}
+
+            <div className="field">
+              <span className="field-label">I want to hear:</span>
+              <select value={lang} onChange={(event) => switchLanguage(event.target.value)}>
+                {languages.map((language) => (
+                  <option key={language.code} value={language.code}>
+                    {language.name}
+                  </option>
+                ))}
+              </select>
+            </div>
 
             <div className="field">
               <span className="field-label">My name in this meeting</span>
