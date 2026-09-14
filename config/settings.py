@@ -151,6 +151,13 @@ class Settings(BaseSettings):
     # written to a timestamped .wav file in this directory -- lets you
     # literally play back what the backend received, to check for
     # distortion, gaps, or duplicated audio. Leave unset in normal use.
+    # Phase 15: relay the untranslated meeting audio to listeners so the
+    # client can offer a real original-vs-translation balance control.
+    # Off by default -- it roughly doubles per-listener bandwidth, and is
+    # only useful to a listener who has muted Teams (our copy arrives ~1s
+    # behind Teams' own output, so both at once is heard twice, offset).
+    relay_original_audio: bool = False
+
     debug_audio_dump_dir: Optional[str] = None
 
 

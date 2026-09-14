@@ -29,6 +29,7 @@ export const TEAMS_PANEL_STATE = {
   inTeams: false,
   frameContext: null,
   locale: null,
+  displayName: null,
 };
 
 async function probe() {
@@ -55,6 +56,10 @@ async function probe() {
     // MeetingListener.jsx), but read here because it is the obvious
     // basis for auto-selecting one later.
     locale: context?.app?.locale ?? null,
+    // Phase 16: who is viewing this panel. Used to suppress the
+    // translation of their own speech -- the bot attributes each phrase
+    // to a Teams roster name, and this is the same name for the viewer.
+    displayName: context?.user?.displayName ?? null,
   };
 }
 
@@ -71,7 +76,7 @@ export function initTeamsPanel() {
       .catch(() => {
         // Not running inside Teams (a normal browser tab), or the host
         // never answered. Either way this page works standalone.
-        return { inTeams: false, frameContext: null, locale: null };
+        return { inTeams: false, frameContext: null, locale: null, displayName: null };
       });
   }
   return probePromise;

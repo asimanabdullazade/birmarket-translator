@@ -178,6 +178,28 @@ class StatusMessage(BaseModel):
     detail: Optional[str] = None
 
 
+class OriginalAudioMessage(BaseModel):
+    """Phase 15: a chunk of the UNTRANSLATED meeting audio, relayed to
+    listeners so the client can mix original against translation.
+
+    This exists because the original audio is otherwise not ours to
+    control: in the Teams side panel it is the Teams client playing
+    through the user's speakers, and the panel is an iframe beside it with
+    no handle on that stream. A real balance control therefore requires
+    owning both streams, which means relaying this.
+
+    Listeners are expected to mute Teams when they use it -- our copy
+    arrives roughly a second later (capture, tunnel, jitter buffer), so
+    played alongside Teams' own output it is heard twice, offset. The UI
+    says so, and defaults the original volume to zero.
+    """
+
+    type: Literal["original_audio"] = "original_audio"
+    audio_base64: str
+    sample_rate: int
+    timestamp: str
+
+
 class TranscriptMessage(BaseModel):
     """The source-language speech-to-text result (interim or final).
 
@@ -247,6 +269,10 @@ class AudioMessage(BaseModel):
     frontend/src/audio/audioPlayback.js)."""
 
     type: Literal["audio"] = "audio"
+    # Phase 16: who was speaking, so a listener can suppress the
+    # translation of their OWN speech. Without it on the audio messages
+    # too, the text could be filtered but the voice would still play.
+    speaker: Optional[str] = None
     audio_base64: str
     sample_rate: int
     timestamp: str

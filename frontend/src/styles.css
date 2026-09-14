@@ -476,3 +476,19 @@ select {
 .teams-panel .volume-hint {
   font-size: 10px;
 }
+
+/* Phase 16: automatic ducking toggle, under the original-volume slider. */
+.duck-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+  font-size: 11px;
+  opacity: 0.75;
+  cursor: pointer;
+}
+
+.duck-toggle input[type="checkbox"] {
+  width: auto;
+  margin: 0;
+}
