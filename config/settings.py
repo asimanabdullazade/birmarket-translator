@@ -156,6 +156,28 @@ class Settings(BaseSettings):
     # Off by default -- it roughly doubles per-listener bandwidth, and is
     # only useful to a listener who has muted Teams (our copy arrives ~1s
     # behind Teams' own output, so both at once is heard twice, offset).
+    # Phase 17: transcripts come from a DEDICATED transcription model
+    # rather than from the translate sessions' input_transcription.
+    #
+    # Google documents the reason under Live Translate's limitations:
+    # "Language detection struggles with heavy accents, similar
+    # languages, or rapid language switches. Note: This should only
+    # impact the input transcript. Language codes and the final
+    # translation should still be accurate." That matched exactly what a
+    # real meeting showed -- Azerbaijani translated correctly into
+    # English while the Azerbaijani transcript on screen was nonsense.
+    #
+    # gemini-3.5-transcribe-live is a dedicated speech-recognition
+    # pipeline rather than a conversational agent, and unlike the
+    # translate model it documents language_codes biasing.
+    use_dedicated_transcription: bool = True
+    gemini_transcribe_model: str = "gemini-3.5-transcribe-live"
+
+    # Optional speech biasing for the transcription model: product names,
+    # acronyms, people's names -- the terms a general recogniser mangles.
+    # This is the hook for a company glossary.
+    transcription_vocabulary: list[str] = []
+
     relay_original_audio: bool = False
 
     debug_audio_dump_dir: Optional[str] = None
