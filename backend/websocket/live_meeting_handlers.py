@@ -472,6 +472,192 @@ class _MeetingLiveSession:
         await locked_finalize("session stopped")
 
 
+class _TranscriptionSession:
+    """A dedicated speech-recognition session, used only for transcripts.
+
+    WHY THIS IS SEPARATE FROM THE TRANSLATE SESSIONS
+    ------------------------------------------------
+    The translate model emits an input_transcription as a side channel,
+    and that is what transcripts used to come from. Google documents its
+    weakness under Live Translate's limitations: language detection
+    struggles with accents and similar languages, and -- importantly --
+    "this should only impact the input transcript. Language codes and the
+    final translation should still be accurate."
+
+    A real meeting showed exactly that: Azerbaijani translated correctly
+    into English while the Azerbaijani transcript read as random words.
+    Tuning the translate sessions could not have fixed it; the transcript
+    is a by-product there, not the product.
+
+    gemini-3.5-transcribe-live is a recognition pipeline proper, and
+    unlike the translate model it documents language_codes biasing and
+    custom_vocabulary. So transcripts come from here, and translation
+    stays where it already works.
+    """
+
+    def __init__(
+        self,
+        settings: Settings,
+        registry: MeetingRegistry,
+        meeting_id: str,
+        speaker_provider: Callable[[], Optional[str]],
+    ) -> None:
+        self._settings = settings
+        self._registry = registry
+        self._meeting_id = meeting_id
+        self._speaker_provider = speaker_provider
+        self._session: Optional[object] = None
+        self._stop = False
+        self._phrase = _Phrase()
+        self._lock = asyncio.Lock()
+
+    async def feed(self, pcm16: bytes, sample_rate: int) -> None:
+        session = self._session
+        if session is None or self._stop:
+            return
+        try:
+            from google.genai import types
+
+            await session.send_realtime_input(  # type: ignore[attr-defined]
+                audio=types.Blob(data=pcm16, mime_type=f"audio/pcm;rate={sample_rate}")
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("Meeting %s [transcribe]: dropped a frame", self._meeting_id, exc_info=True)
+
+    def request_stop(self) -> None:
+        self._stop = True
+
+    async def run(self) -> None:
+        from google import genai
+        from google.genai import errors as genai_errors
+        from google.genai import types
+
+        client = genai.Client(api_key=self._settings.gemini_api_key)
+        loop = asyncio.get_event_loop()
+        finalize_silence_s = self._settings.gemini_live_finalize_silence_ms / 1000
+
+        def _build(with_vocab: bool):
+            kwargs = {"language_codes": list(self._settings.meeting_languages)}
+            if with_vocab and self._settings.transcription_vocabulary:
+                kwargs["custom_vocabulary"] = list(self._settings.transcription_vocabulary)
+            return types.LiveConnectConfig(
+                response_modalities=["TEXT"],
+                input_audio_transcription=types.AudioTranscriptionConfig(**kwargs),
+            )
+
+        # custom_vocabulary is newer than language_codes; if this SDK or
+        # model build rejects it, drop it rather than lose transcripts.
+        use_vocab = True
+        try:
+            config = _build(True)
+        except TypeError:
+            use_vocab = False
+            config = _build(False)
+            logger.warning(
+                "Meeting %s [transcribe]: this SDK's AudioTranscriptionConfig has no "
+                "custom_vocabulary -- continuing without speech biasing.",
+                self._meeting_id,
+            )
+
+        async def finalize(reason: str) -> None:
+            phrase = self._phrase
+            text = phrase.input_text.strip()
+            if text:
+                payload = TranscriptMessage(
+                    text=text,
+                    is_final=True,
+                    timestamp=phrase.started_at,
+                    speaker=phrase.speaker,
+                ).model_dump_json()
+                # Transcripts go to every room: a listener sees what was
+                # said as well as what it means.
+                for lang in self._settings.meeting_languages:
+                    await self._registry.broadcast(self._meeting_id, lang, payload)
+                logger.info(
+                    "Meeting %s [transcribe]: %s speaker=%r %r",
+                    self._meeting_id,
+                    reason,
+                    phrase.speaker,
+                    text[:100],
+                )
+            self._phrase = _Phrase(speaker=self._speaker_provider())
+
+        async def locked_finalize(reason: str) -> None:
+            async with self._lock:
+                await finalize(reason)
+
+        async def watchdog() -> None:
+            while not self._stop:
+                await asyncio.sleep(0.25)
+                phrase = self._phrase
+                if phrase.input_text and (loop.time() - phrase.last_input_activity) >= finalize_silence_s:
+                    await locked_finalize("silence")
+
+        watch = asyncio.create_task(watchdog(), name=f"transcribe-watchdog-{self._meeting_id}")
+        attempt = 0
+
+        while not self._stop:
+            attempt += 1
+            try:
+                async with client.aio.live.connect(
+                    model=self._settings.gemini_transcribe_model, config=config
+                ) as session:
+                    if self._stop:
+                        break
+                    self._session = session
+                    logger.info(
+                        "Meeting %s [transcribe]: connected to %s (languages=%s, vocabulary=%d terms)",
+                        self._meeting_id,
+                        self._settings.gemini_transcribe_model,
+                        ",".join(self._settings.meeting_languages),
+                        len(self._settings.transcription_vocabulary) if use_vocab else 0,
+                    )
+
+                    while not self._stop:
+                        async for response in session.receive():
+                            if self._stop:
+                                break
+                            content = response.server_content
+                            if content is None or content.input_transcription is None:
+                                continue
+                            text = content.input_transcription.text
+                            if text:
+                                phrase = self._phrase
+                                if not phrase.input_text:
+                                    phrase.speaker = self._speaker_provider()
+                                phrase.input_text += text
+                                phrase.last_input_activity = loop.time()
+                            if content.input_transcription.finished:
+                                await locked_finalize("finished")
+
+            except asyncio.CancelledError:
+                raise
+            except genai_errors.ClientError as exc:
+                if exc.code in (401, 403, 404):
+                    logger.error(
+                        "Meeting %s [transcribe]: no access to %s (%s). Transcripts will be missing; "
+                        "translation is unaffected. Set USE_DEDICATED_TRANSCRIPTION=false to fall back "
+                        "to the translate sessions' own transcripts.",
+                        self._meeting_id,
+                        self._settings.gemini_transcribe_model,
+                        exc.code,
+                    )
+                    self._stop = True
+                    break
+                logger.warning("Meeting %s [transcribe]: retrying after %s", self._meeting_id, exc)
+            except Exception:  # noqa: BLE001
+                if not self._stop:
+                    logger.exception("Meeting %s [transcribe]: session ended, retrying", self._meeting_id)
+            finally:
+                self._session = None
+
+            if self._stop:
+                break
+            await asyncio.sleep(min(attempt * 1.0, 5.0))
+
+        watch.cancel()
+
+
 class _SessionPool:
     """Keeps exactly one live session open per language that has listeners."""
 
@@ -488,6 +674,8 @@ class _SessionPool:
         self._speaker_provider = speaker_provider
         self._sessions: Dict[str, _MeetingLiveSession] = {}
         self._tasks: Dict[str, asyncio.Task] = {}
+        self._transcriber: Optional[_TranscriptionSession] = None
+        self._transcriber_task: Optional[asyncio.Task] = None
 
     def _wanted_languages(self) -> list[str]:
         return [
@@ -500,10 +688,24 @@ class _SessionPool:
         wanted = set(self._wanted_languages())
         current = set(self._sessions)
 
+        # With a dedicated transcriber running, the translate sessions
+        # must NOT also broadcast their own input transcripts -- that is
+        # precisely the weak transcript this replaces, and listeners
+        # would get both.
+        if wanted and self._settings.use_dedicated_transcription and self._transcriber is None:
+            self._transcriber = _TranscriptionSession(
+                self._settings, self._registry, self._meeting_id, self._speaker_provider
+            )
+            self._transcriber_task = asyncio.create_task(
+                self._transcriber.run(), name=f"transcribe-{self._meeting_id}"
+            )
+            logger.info("Meeting %s: opening dedicated transcription session", self._meeting_id)
+
         for lang in wanted - current:
-            # Exactly one session is primary, so the source-language
-            # transcript is broadcast once rather than once per language.
-            is_primary = not any(s.is_primary for s in self._sessions.values())
+            is_primary = (
+                not self._settings.use_dedicated_transcription
+                and not any(s.is_primary for s in self._sessions.values())
+            )
             session = _MeetingLiveSession(
                 lang, self._settings, self._registry, self._meeting_id, self._speaker_provider, is_primary
             )
@@ -516,8 +718,12 @@ class _SessionPool:
             await self._close(lang)
 
         # If the primary went away, promote another so transcripts keep
-        # flowing.
-        if self._sessions and not any(s.is_primary for s in self._sessions.values()):
+        # flowing. Not needed when a dedicated transcriber owns them.
+        if (
+            not self._settings.use_dedicated_transcription
+            and self._sessions
+            and not any(s.is_primary for s in self._sessions.values())
+        ):
             next(iter(self._sessions.values())).is_primary = True
 
     async def _close(self, lang: str) -> None:
@@ -533,15 +739,28 @@ class _SessionPool:
                 pass
 
     async def feed(self, pcm16: bytes, sample_rate: int) -> None:
-        if not self._sessions:
+        targets = list(self._sessions.values())
+        if self._transcriber is not None:
+            targets.append(self._transcriber)
+        if not targets:
             return
         await asyncio.gather(
-            *(s.feed(pcm16, sample_rate) for s in self._sessions.values()), return_exceptions=True
+            *(t.feed(pcm16, sample_rate) for t in targets), return_exceptions=True
         )
 
     async def close_all(self) -> None:
         for lang in list(self._sessions):
             await self._close(lang)
+        if self._transcriber is not None:
+            self._transcriber.request_stop()
+            self._transcriber = None
+        if self._transcriber_task is not None:
+            self._transcriber_task.cancel()
+            try:
+                await self._transcriber_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+            self._transcriber_task = None
 
 
 async def handle_meeting_ingest_live(
